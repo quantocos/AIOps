@@ -45,7 +45,7 @@ bash aiops.sh
 Or install directly without cloning:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/quantocos/AIOps/refs/heads/main/aiops.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/quantocos/AIOps/main/aiops.sh)
 ```
 
 ---
