@@ -23,7 +23,7 @@ Run them in that order. Each is idempotent — safe to re-run if interrupted.
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/aiops.git
+git clone https://github.com/quantocos/AIOps.git
 cd aiops
 
 # 2. Run the main installer (WSL2 terminal)
@@ -45,7 +45,7 @@ bash aiops.sh
 Or install directly without cloning:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/aiops/main/aiops.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/quantocos/AIOps/refs/heads/main/aiops.sh)
 ```
 
 ---
