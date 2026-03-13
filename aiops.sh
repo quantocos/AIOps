@@ -248,6 +248,7 @@ install_system_deps() {
         build-essential ffmpeg lsof \
         ca-certificates gnupg \
         lsb-release \
+        zstd \
         2>/dev/null
 
     _log_core "System dependencies installed"
@@ -495,6 +496,13 @@ install_ollama() {
     fi
 
     curl -fsSL https://ollama.com/install.sh | sh
+
+    # Verify — the installer exits 0 even on failure in some cases
+    if ! command -v ollama &>/dev/null; then
+        _error_core "Ollama install failed. Check the error above."
+        _warn_core  "To fix manually: sudo apt-get install zstd && curl -fsSL https://ollama.com/install.sh | sh"
+        return 1
+    fi
 
     # Configure to listen on all interfaces for LAN access
     sudo mkdir -p /etc/systemd/system/ollama.service.d
