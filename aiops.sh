@@ -11,7 +11,9 @@
 #   PART 2 — Addons loop (runs until user types 'exit')
 # ============================================================
 
-set -e
+# Do NOT use set -e — we handle errors explicitly.
+# A failed optional step (avahi, a pip package) must never
+# kill the entire installer for every future user.
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -68,7 +70,10 @@ confirm() {
 
 nvm_load() {
     export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+    # shellcheck source=/dev/null
+    if [ -s "$NVM_DIR/nvm.sh" ]; then
+        \. "$NVM_DIR/nvm.sh"
+    fi
 }
 
 # ============================================================
@@ -113,6 +118,10 @@ preinit() {
     touch "$LOG_FILE"
     mkdir -p "$AIOPS_HOME"
     touch "$ADDONS_LOG"
+    # Ensure lsb_release is available before preflight runs
+    if ! command -v lsb_release &>/dev/null; then
+        sudo apt-get install -y lsb-release -qq 2>/dev/null || true
+    fi
 }
 
 # ── Preflight ────────────────────────────────────────────────
@@ -346,8 +355,6 @@ install_caddy() {
             header_up Connection {http.headers.Connection}
             header_up Host {host}
             header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
         }
     }
 
@@ -420,8 +427,6 @@ install_caddy() {
         reverse_proxy localhost:8080 {
             header_up Host {host}
             header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
         }
     }
 }
@@ -450,9 +455,16 @@ install_node() {
     fi
 
     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
-    nvm_load
+
+    # The NVM installer writes to ~/.bashrc but that won't reload
+    # in a non-interactive script. Source the file directly now.
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck source=/dev/null
+    \. "$NVM_DIR/nvm.sh"
+
     nvm install "$NODE_VERSION"
     nvm alias default "$NODE_VERSION"
+    nvm use "$NODE_VERSION"
 
     _log_core "Node.js $(node -v) installed"
     _log_core "npm $(npm -v) ready"
@@ -530,7 +542,9 @@ install_openwebui() {
         return
     fi
 
+    # shellcheck disable=SC2086
     pip install "open-webui==$OPEN_WEBUI_VERSION" $PIP_FLAGS
+    # shellcheck disable=SC2086
     pip install qdrant-client $PIP_FLAGS
     export PATH="$HOME/.local/bin:$PATH"
 
