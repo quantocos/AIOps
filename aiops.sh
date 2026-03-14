@@ -30,9 +30,12 @@ ADDONS_LOG="$AIOPS_HOME/addons.log"
 
 # ── Pinned versions ──────────────────────────────────────────
 NODE_VERSION="22"
-OPEN_WEBUI_VERSION="0.8.10"
-QDRANT_VERSION="v1.14.4"
-QDRANT_WEBUI_VERSION="v0.1.28"
+# OpenWebUI: always install latest stable — pinning causes pip conflicts on new Python
+OPEN_WEBUI_VERSION="latest"
+# Qdrant: use "latest" redirect — never pin a version that may not exist
+# The download function resolves the real version at install time
+QDRANT_VERSION="latest"
+QDRANT_WEBUI_VERSION="latest"
 CREWAI_VERSION="0.80.0"
 CREWAI_TOOLS_VERSION="0.14.0"
 AIDER_VERSION="0.66.0"
@@ -493,20 +496,43 @@ install_qdrant() {
     local qdrant_bin="$HOME/qdrant"
 
     if [ ! -f "$qdrant_bin" ]; then
-        _info "Downloading Qdrant ${QDRANT_VERSION}..."
-        local arch="x86_64"
+        _info "Downloading Qdrant (latest)..."
+
+        # Resolve the real download URL via GitHub latest redirect
+        # This avoids pinning a version that may not exist
+        local dl_url
         if [ "$OS_TYPE" = "mac" ]; then
-            arch=$(uname -m)  # x86_64 or arm64
-            curl -L "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-${arch}-apple-darwin.tar.gz" \
-                -o /tmp/qdrant.tar.gz 2>/dev/null
+            local arch; arch=$(uname -m)  # x86_64 or arm64
+            dl_url="https://github.com/qdrant/qdrant/releases/latest/download/qdrant-${arch}-apple-darwin.tar.gz"
         else
-            curl -L "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz" \
-                -o /tmp/qdrant.tar.gz 2>/dev/null
+            dl_url="https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-unknown-linux-gnu.tar.gz"
         fi
-        tar -xzf /tmp/qdrant.tar.gz -C "$HOME" 2>/dev/null
-        rm -f /tmp/qdrant.tar.gz
+
+        curl -fsSL "$dl_url" -o /tmp/qdrant.tar.gz 2>/dev/null
+        if [ ! -s /tmp/qdrant.tar.gz ]; then
+            _fail "Qdrant (download failed)"
+            return 1
+        fi
+
+        # Extract to a temp dir first — archive structure varies by release
+        rm -rf /tmp/qdrant-extract
+        mkdir -p /tmp/qdrant-extract
+        tar -xzf /tmp/qdrant.tar.gz -C /tmp/qdrant-extract 2>/dev/null
+
+        # Find the binary regardless of directory structure in the archive
+        local extracted_bin
+        extracted_bin=$(find /tmp/qdrant-extract -name "qdrant" -type f 2>/dev/null | head -1)
+
+        if [ -z "$extracted_bin" ]; then
+            _fail "Qdrant (binary not found in archive)"
+            rm -rf /tmp/qdrant.tar.gz /tmp/qdrant-extract
+            return 1
+        fi
+
+        cp "$extracted_bin" "$qdrant_bin"
         chmod +x "$qdrant_bin"
-        _log "Qdrant binary ready"
+        rm -rf /tmp/qdrant.tar.gz /tmp/qdrant-extract
+        _log "Qdrant binary ready: $qdrant_bin"
     else
         _log "Qdrant binary already exists"
     fi
@@ -556,18 +582,20 @@ install_openwebui() {
     local venv="$VENVS_DIR/openwebui"
 
     if [ ! -d "$venv" ]; then
-        _info "Creating OpenWebUI venv..."
+        _info "Creating OpenWebUI venv (Python: $($PYTHON_BIN --version 2>&1))..."
         "$PYTHON_BIN" -m venv "$venv"
         "$venv/bin/pip" install --upgrade pip setuptools wheel -q 2>/dev/null
     fi
 
     if ! "$venv/bin/python" -c "import open_webui" 2>/dev/null; then
-        _info "Installing OpenWebUI ${OPEN_WEBUI_VERSION} (this takes a few minutes)..."
-        "$venv/bin/pip" install "open-webui==${OPEN_WEBUI_VERSION}" -q 2>/dev/null
+        _info "Installing OpenWebUI (latest stable — this takes a few minutes)..."
+        # Always install latest — pinning specific versions causes pip conflicts
+        # on different Python versions and Ubuntu releases
+        "$venv/bin/pip" install open-webui -q 2>/dev/null
         if ! "$venv/bin/python" -c "import open_webui" 2>/dev/null; then
-            # Try latest if pinned version fails
-            _warn "Pinned version failed, trying latest..."
-            "$venv/bin/pip" install open-webui -q 2>/dev/null
+            # Try with no cache if first attempt failed
+            _warn "First attempt failed, retrying without cache..."
+            "$venv/bin/pip" install open-webui --no-cache-dir 2>/dev/null
         fi
     else
         _log "OpenWebUI already installed in venv"
