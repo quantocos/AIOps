@@ -1,18 +1,13 @@
 #!/bin/bash
 # ============================================================
 # AIOPS.SH — Local AI Operations Server
-# Version:    5.3.0
+# Version:    6.0.0
 # Author:     Quantocos AI Labs
-# Compatible: WSL2 Ubuntu 22.04 / 24.04
-# Usage:      bash aiops.sh
-#
-# ARCHITECTURE:
-#   - No hardcoded IPs, domains, or ports anywhere in launchers
-#   - All config lives in $AIOPS_CONF (~/aiops-server/aiops.conf)
-#   - Every launcher sources the config at runtime
-#   - Change config → restart PM2 → everything updates
-#   - Works for any username, any machine, any network
+# Compatible: Ubuntu 22.04/24.04 (native + WSL2) · macOS 12+
+# Usage:      bash <(curl -fsSL https://raw.githubusercontent.com/quantocos/AIOps/main/aiops.sh)
 # ============================================================
+
+set +e  # Never exit on error — we handle everything explicitly
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -20,11 +15,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ── Static paths only — nothing machine-specific ─────────────
+# ── Static paths ─────────────────────────────────────────────
 AIOPS_HOME="$HOME/aiops-server"
 AIOPS_CONF="$AIOPS_HOME/aiops.conf"
 SCRIPTS_DIR="$HOME/scripts"
@@ -34,52 +28,98 @@ QDRANT_DIR="$HOME/qdrant-data"
 LOG_FILE="$AIOPS_HOME/install.log"
 ADDONS_LOG="$AIOPS_HOME/addons.log"
 
-# ── Pinned Versions ──────────────────────────────────────────
+# ── Pinned versions ──────────────────────────────────────────
 NODE_VERSION="22"
 OPEN_WEBUI_VERSION="0.8.10"
-QDRANT_VERSION="v1.17.0"
-QDRANT_WEBUI_VERSION="v0.2.7"
-CREWAI_VERSION="1.10.1"
-CREWAI_TOOLS_VERSION="1.10.1"
-OPEN_INTERPRETER_VERSION="0.4.3"
-AIDER_VERSION="0.86.2"
+QDRANT_VERSION="v1.14.4"
+QDRANT_WEBUI_VERSION="v0.1.28"
+CREWAI_VERSION="0.80.0"
+CREWAI_TOOLS_VERSION="0.14.0"
+AIDER_VERSION="0.66.0"
+OPEN_INTERPRETER_VERSION="0.3.17"
+N8N_VERSION="1.69.2"
 
-# ── Runtime globals (populated during execution) ─────────────
-UBUNTU_VERSION="0"
+# ── Runtime globals ──────────────────────────────────────────
+OS_TYPE=""        # linux | mac
+IS_WSL=false
+PKG_MGR=""        # apt | brew
 PIP_FLAGS=""
+PYTHON_BIN=""
+INSTALL_FAILURES=()
 
-# ── Helpers ──────────────────────────────────────────────────
-_log()     { echo -e "${GREEN}[✓]${NC} $1" | tee -a "$LOG_FILE"; }
+# ── Logging ──────────────────────────────────────────────────
+mkdir -p "$AIOPS_HOME"
+touch "$LOG_FILE" "$ADDONS_LOG" 2>/dev/null
+
+_log()     { echo -e "${GREEN}[+]${NC} $1" | tee -a "$LOG_FILE"; }
 _warn()    { echo -e "${YELLOW}[!]${NC} $1" | tee -a "$LOG_FILE"; }
-_error()   { echo -e "${RED}[✗]${NC} $1" | tee -a "$LOG_FILE"; exit 1; }
-_info()    { echo -e "${CYAN}[→]${NC} $1" | tee -a "$LOG_FILE"; }
-_section() { echo -e "\n${BOLD}${BLUE}══ $1 ══${NC}\n" | tee -a "$LOG_FILE"; }
-
-_log_add()     { echo -e "${GREEN}[✓]${NC} $1" | tee -a "$ADDONS_LOG"; }
-_warn_add()    { echo -e "${YELLOW}[!]${NC} $1" | tee -a "$ADDONS_LOG"; }
-_info_add()    { echo -e "${CYAN}[→]${NC} $1" | tee -a "$ADDONS_LOG"; }
-_section_add() { echo -e "\n${BOLD}${MAGENTA}══ $1 ══${NC}\n" | tee -a "$ADDONS_LOG"; }
+_error()   { echo -e "${RED}[x]${NC} $1" | tee -a "$LOG_FILE"; }
+_info()    { echo -e "${CYAN}[>]${NC} $1" | tee -a "$LOG_FILE"; }
+_section() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n" | tee -a "$LOG_FILE"; }
+_section_add() { echo -e "\n${BOLD}${CYAN}=== $1 ===${NC}\n" | tee -a "$ADDONS_LOG"; }
+_log_add() { echo -e "${GREEN}[+]${NC} $1" | tee -a "$ADDONS_LOG"; }
+_warn_add(){ echo -e "${YELLOW}[!]${NC} $1" | tee -a "$ADDONS_LOG"; }
+_fail()    { INSTALL_FAILURES+=("$1"); _error "FAILED: $1 — continuing"; }
 
 confirm() {
-    read -rp "$(echo -e "${YELLOW}$1 [y/N]: ${NC}")" r
-    [[ "$r" =~ ^[Yy]$ ]]
+    local msg="$1"
+    local default="${2:-n}"
+    local prompt
+    [ "$default" = "y" ] && prompt="[Y/n]" || prompt="[y/N]"
+    read -rp "$(echo -e "${YELLOW}${msg} ${prompt}: ${NC}")" r
+    case "$r" in
+        [Yy]*) return 0 ;;
+        [Nn]*) return 1 ;;
+        "")    [ "$default" = "y" ] && return 0 || return 1 ;;
+        *)     return 1 ;;
+    esac
 }
 
 nvm_load() {
     export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null
+    [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" 2>/dev/null
 }
 
-# ── Source the config file (used by all functions that need ports/domain) ──
 conf_load() {
-    [ -f "$AIOPS_CONF" ] && source "$AIOPS_CONF"
+    [ -f "$AIOPS_CONF" ] && source "$AIOPS_CONF" 2>/dev/null
+}
+
+# ── OS Detection ─────────────────────────────────────────────
+detect_os() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        OS_TYPE="mac"
+        PKG_MGR="brew"
+        PIP_FLAGS=""
+        _log "OS: macOS detected"
+    elif grep -qi "ubuntu\|debian" /etc/os-release 2>/dev/null; then
+        OS_TYPE="linux"
+        PKG_MGR="apt"
+        local ver
+        ver=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
+        # Ubuntu 24.04+ needs --break-system-packages for pip installs outside venv
+        if awk "BEGIN {exit !($ver >= 23.0)}"; then
+            PIP_FLAGS="--break-system-packages"
+        fi
+        _log "OS: Ubuntu $ver detected"
+    else
+        _error "Unsupported OS. This script supports Ubuntu 22.04+, 24.04+, and macOS 12+."
+        exit 1
+    fi
+
+    if grep -qi "microsoft" /proc/version 2>/dev/null; then
+        IS_WSL=true
+        _log "Environment: WSL2 detected"
+    fi
 }
 
 # ============================================================
-# BANNERS
+# BANNER
 # ============================================================
-banner_core() {
-cat << 'BANNER'
+show_banner() {
+    clear
+    echo -e "${BOLD}${CYAN}"
+    cat << 'BANNER'
 
    ____  _   _   _    _   _ _____ ___   ____  ___  ____
   / __ \| | | | / \  | \ | |_   _/ _ \ / ___|/ _ \/ ___|
@@ -87,107 +127,91 @@ cat << 'BANNER'
  | |__| | |_| / ___ \| |\  | | || |_| | |___| |_| |___) |
   \___\_\\___/_/   \_\_| \_| |_| \___/ \____|\___/|____/
 
-  ─────────────────────────────────────────────────────────
-  Local AI Operations Server  ·  Quantocos AI Labs  ·  v5.3.0
-  WSL2 Ubuntu 22.04 / 24.04
-  ─────────────────────────────────────────────────────────
-
 BANNER
-}
-
-banner_addons() {
-cat << 'BANNER'
-
-   ____  _   _   _    _   _ _____ ___   ____  ___  ____
-  / __ \| | | | / \  | \ | |_   _/ _ \ / ___|/ _ \/ ___|
- | |  | | | | |/ _ \ |  \| | | || | | | |   | | | \___ \
- | |__| | |_| / ___ \| |\  | | || |_| | |___| |_| |___) |
-  \___\_\\___/_/   \_\_| \_| |_| \___/ \____|\___/|____/
-
-  ─────────────────────────────────────────────────────────
-  Optional Tools Installer  ·  Quantocos AI Labs  ·  v5.3.0
-  ─────────────────────────────────────────────────────────
-
-BANNER
-}
-
-# ============================================================
-# PART 1 — CORE INSTALL
-# ============================================================
-
-preinit() {
-    mkdir -p "$AIOPS_HOME"
-    touch "$LOG_FILE" "$ADDONS_LOG"
-    command -v lsb_release &>/dev/null || sudo apt-get install -y lsb-release -qq 2>/dev/null || true
-}
-
-# ── Preflight ────────────────────────────────────────────────
-preflight() {
-    _section "Preflight Checks"
-
-    grep -qi "ubuntu" /etc/os-release 2>/dev/null \
-        || _error "This script requires Ubuntu. Detected: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
-
-    UBUNTU_VERSION=$(lsb_release -rs 2>/dev/null \
-        || grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
-
-    case "$UBUNTU_VERSION" in
-        24.04) _log "OS: Ubuntu 24.04 LTS — fully supported"; PIP_FLAGS="--break-system-packages" ;;
-        22.04) _log "OS: Ubuntu 22.04 LTS — supported"; PIP_FLAGS="" ;;
-        20.04) _warn "OS: Ubuntu 20.04 — Python 3.8 default. Recommend upgrading."; PIP_FLAGS="" ;;
-        *)
-            _warn "OS: Ubuntu $UBUNTU_VERSION — untested. Proceeding."
-            awk "BEGIN {exit !($UBUNTU_VERSION >= 24.04)}" && PIP_FLAGS="--break-system-packages" || PIP_FLAGS=""
-            ;;
-    esac
-
-    grep -qi "microsoft" /proc/version 2>/dev/null \
-        && _log "Environment: WSL2 detected" \
-        || _warn "Not running in WSL2 — optimised for WSL2 but continuing"
-
-    curl -s --max-time 5 https://google.com > /dev/null \
-        || _error "No internet connection."
-    _log "Internet: Connected"
-
-    AVAILABLE=$(df ~ | awk 'NR==2 {print $4}')
-    [ "$AVAILABLE" -lt 20971520 ] \
-        && _warn "Low disk space: $(df -h ~ | awk 'NR==2 {print $4}') — recommend 20GB+" \
-        || _log "Disk: $(df -h ~ | awk 'NR==2 {print $4}') free"
-
-    TOTAL_RAM=$(free -g | awk 'NR==2 {print $2}')
-    [ "$TOTAL_RAM" -lt 16 ] \
-        && _warn "RAM: ${TOTAL_RAM}GB — 16GB+ recommended for 14B models" \
-        || _log "RAM: ${TOTAL_RAM}GB"
-}
-
-# ── Config file — single source of truth ─────────────────────
-# All launchers source this file at runtime. Nothing is hardcoded
-# into launcher scripts. Change this file, restart PM2, done.
-setup_config() {
-    _section "Configuration"
-
-    echo -e "${CYAN}This name is used for LAN access via mDNS.${NC}"
-    echo -e "${CYAN}Example: 'myserver' → http://myserver.local${NC}"
+    echo -e "${NC}"
+    echo -e "  ${BOLD}Local AI Operations Server  |  Quantocos AI Labs  |  v6.0.0${NC}"
+    echo    "  ─────────────────────────────────────────────────────────────"
     echo ""
-    read -rp "$(echo -e "${YELLOW}Enter .local domain name (Enter for 'aiops'): ${NC}")" domain_input
+}
 
-    local domain_base="${domain_input%.local}"
-    [ -z "$domain_base" ] && domain_base="aiops"
-    local local_domain="${domain_base}.local"
+# ============================================================
+# STEP 1 — MODE SELECTION
+# ============================================================
+select_mode() {
+    _section "Installation Mode"
+    echo "  What would you like to install?"
+    echo ""
+    echo "  [1] Core Stack only"
+    echo "      Ollama, OpenWebUI, n8n, Qdrant, CrewAI Studio"
+    echo ""
+    echo "  [2] Addons only"
+    echo "      Twenty CRM, Listmonk, Mautic, Chatwoot, Cal.com,"
+    echo "      Langfuse, Netdata  (requires Core already installed)"
+    echo ""
+    echo "  [3] Full install — Core + Addons"
+    echo ""
+    local choice
+    while true; do
+        read -rp "$(echo -e "${YELLOW}  Enter choice [1/2/3]: ${NC}")" choice
+        case "$choice" in
+            1) INSTALL_MODE="core";   break ;;
+            2) INSTALL_MODE="addons"; break ;;
+            3) INSTALL_MODE="full";   break ;;
+            *) echo "  Please enter 1, 2, or 3" ;;
+        esac
+    done
+    _log "Mode: $INSTALL_MODE"
+}
 
-    # Write the config file — this is the ONLY place ports and domain live.
-    # Launchers source this at runtime — never baked into script text.
+# ============================================================
+# STEP 2 — DOMAIN NAME
+# ============================================================
+setup_domain() {
+    _section "Domain Name"
+    echo -e "  ${CYAN}Choose a name for accessing your services on this network.${NC}"
+    echo -e "  ${CYAN}Example: 'myserver' gives you http://myserver.local${NC}"
+    echo -e "  ${CYAN}Press Enter to use the default: aiops${NC}"
+    echo ""
+    local domain_input
+    read -rp "$(echo -e "${YELLOW}  Domain name (default: aiops): ${NC}")" domain_input
+    domain_input="${domain_input%.local}"
+    [ -z "$domain_input" ] && domain_input="aiops"
+    AIOPS_DOMAIN="${domain_input}.local"
+    _log "Domain: $AIOPS_DOMAIN"
+}
+
+# ============================================================
+# STEP 3 — STREAMLIT EMAIL
+# ============================================================
+setup_streamlit_email() {
+    _section "CrewAI Studio Setup"
+    echo -e "  ${CYAN}CrewAI Studio asks for an email address on first run.${NC}"
+    echo -e "  ${CYAN}You can leave this blank by pressing Enter.${NC}"
+    echo ""
+    local email_input
+    read -rp "$(echo -e "${YELLOW}  Email address (or press Enter to skip): ${NC}")" email_input
+    mkdir -p "$HOME/.streamlit"
+    cat > "$HOME/.streamlit/credentials.toml" << EOF
+[general]
+email = "${email_input}"
+EOF
+    _log "Streamlit credentials configured"
+}
+
+# ============================================================
+# STEP 4 — WRITE CONFIG
+# ============================================================
+write_config() {
+    mkdir -p "$AIOPS_HOME"
     cat > "$AIOPS_CONF" << CONF
 # ============================================================
-# AIOPS Configuration — Quantocos AI Labs
+# AIOPS Configuration — Quantocos AI Labs v6.0.0
 # Generated: $(date)
-# Edit this file and run: pm2 restart all
+# Edit this file, then run: pm2 restart all
 # ============================================================
 
-# Domain
-AIOPS_DOMAIN="${local_domain}"
+AIOPS_DOMAIN="${AIOPS_DOMAIN}"
 
-# Ports — change here to avoid conflicts, restart PM2 to apply
 AIOPS_PORT_OPENWEBUI=8080
 AIOPS_PORT_N8N=5678
 AIOPS_PORT_QDRANT=6333
@@ -197,86 +221,743 @@ AIOPS_PORT_LISTMONK=9000
 AIOPS_PORT_MAUTIC=8100
 AIOPS_PORT_CHATWOOT=3100
 AIOPS_PORT_CALCOM=3002
+AIOPS_PORT_LANGFUSE=3004
 AIOPS_PORT_NETDATA=19999
 AIOPS_PORT_OLLAMA=11434
 
-# Paths
+AIOPS_HOME="${AIOPS_HOME}"
+AIOPS_CONF="${AIOPS_CONF}"
 AIOPS_SCRIPTS_DIR="${SCRIPTS_DIR}"
 AIOPS_AGENTS_DIR="${AGENTS_DIR}"
 AIOPS_VENVS_DIR="${VENVS_DIR}"
 AIOPS_QDRANT_DIR="${QDRANT_DIR}"
+AIOPS_LOG="${LOG_FILE}"
 CONF
-
     chmod 600 "$AIOPS_CONF"
-    _log "Config written to $AIOPS_CONF"
-    _info "Domain: $local_domain"
-    _info "Edit $AIOPS_CONF to change ports or domain. Restart PM2 to apply."
-
-    # Source it now so this install session has the values
     conf_load
-
-    mkdir -p "$HOME/.streamlit"
-    cat > "$HOME/.streamlit/credentials.toml" << 'EOF'
-[general]
-email = ""
-EOF
-    _log "Streamlit credentials configured"
+    _log "Config written: $AIOPS_CONF"
 }
 
-# ── Directories ───────────────────────────────────────────────
-setup_dirs() {
-    _section "Creating Directory Structure"
-    mkdir -p "$SCRIPTS_DIR" "$VENVS_DIR"
-    mkdir -p "$AGENTS_DIR"/{crews,tasks,tools,outputs,configs}
-    mkdir -p "$QDRANT_DIR"/{config,static,storage,snapshots}
-    _log "Directories created"
-}
+# ============================================================
+# STEP 5 — PREFLIGHT
+# ============================================================
+preflight() {
+    _section "Preflight Checks"
+    local pass=true
 
-# ── System deps ───────────────────────────────────────────────
-install_system_deps() {
-    _section "Installing System Dependencies"
-    sudo apt-get update -qq
-    sudo apt-get install -y \
-        curl wget git unzip \
-        python3 python3-pip python3-venv \
-        build-essential ffmpeg lsof \
-        ca-certificates gnupg lsb-release zstd \
-        2>/dev/null
-    _log "System dependencies installed"
-}
+    # Internet
+    echo -n "  Internet connectivity ... "
+    if curl -s --max-time 8 https://google.com > /dev/null 2>&1; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${RED}FAILED${NC}"
+        echo ""
+        echo -e "  ${RED}No internet connection detected.${NC}"
+        echo -e "  ${RED}Please check your network and try again.${NC}"
+        exit 1
+    fi
 
-# ── WSL system config ─────────────────────────────────────────
-setup_wsl_system() {
-    _section "WSL System Configuration"
-    if ! grep -q "systemd=true" /etc/wsl.conf 2>/dev/null; then
-        sudo tee -a /etc/wsl.conf > /dev/null << 'EOF'
+    # Disk space
+    echo -n "  Disk space (need 20GB) ... "
+    local available
+    available=$(df "$HOME" | awk 'NR==2 {print $4}')
+    local available_gb=$(( available / 1024 / 1024 ))
+    if [ "$available_gb" -ge 20 ]; then
+        echo -e "${GREEN}${available_gb}GB free${NC}"
+    else
+        echo -e "${YELLOW}${available_gb}GB free (low, recommend 20GB+)${NC}"
+    fi
+
+    # RAM
+    echo -n "  RAM ... "
+    local ram_gb
+    if [ "$OS_TYPE" = "mac" ]; then
+        ram_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
+    else
+        ram_gb=$(free -g | awk 'NR==2 {print $2}')
+    fi
+    if [ "$ram_gb" -ge 8 ]; then
+        echo -e "${GREEN}${ram_gb}GB${NC}"
+    else
+        echo -e "${YELLOW}${ram_gb}GB (8GB+ recommended)${NC}"
+    fi
+
+    # GPU
+    echo -n "  GPU (NVIDIA) ... "
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_name; gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+        local vram; vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1)
+        echo -e "${GREEN}${gpu_name} (${vram})${NC}"
+    else
+        echo -e "${YELLOW}Not detected — Ollama will run on CPU${NC}"
+    fi
+
+    # WSL2 systemd
+    if $IS_WSL; then
+        echo -n "  WSL2 systemd ... "
+        if systemctl status > /dev/null 2>&1; then
+            echo -e "${GREEN}enabled${NC}"
+        else
+            echo -e "${YELLOW}not enabled — enabling now${NC}"
+            sudo tee -a /etc/wsl.conf > /dev/null 2>/dev/null << 'EOF'
 [boot]
 systemd=true
 EOF
-        _log "systemd=true added to /etc/wsl.conf"
-        _warn "WSL restart required after install for systemd to take effect"
+        fi
+    fi
+
+    echo ""
+    confirm "  Everything looks good. Proceed with installation?" "y" || exit 0
+}
+
+# ============================================================
+# CORE INSTALLERS
+# ============================================================
+
+# ── Homebrew (Mac only) ───────────────────────────────────────
+install_homebrew() {
+    [ "$OS_TYPE" != "mac" ] && return
+    if ! command -v brew &>/dev/null; then
+        _info "Installing Homebrew..."
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        # Add brew to PATH for Apple Silicon
+        if [ -f "/opt/homebrew/bin/brew" ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+    fi
+    _log "Homebrew ready"
+}
+
+# ── System packages ───────────────────────────────────────────
+install_system_deps() {
+    _section "System Dependencies"
+
+    if [ "$OS_TYPE" = "linux" ]; then
+        _info "Updating package lists..."
+        sudo apt-get update -qq 2>/dev/null
+
+        _info "Installing system packages..."
+        sudo apt-get install -y \
+            curl wget git unzip zip \
+            build-essential \
+            python3 python3-pip python3-venv python3-dev \
+            lsof ffmpeg zstd \
+            ca-certificates gnupg lsb-release \
+            htop nvtop \
+            avahi-daemon avahi-utils libnss-mdns \
+            2>/dev/null || true
+
+        # Python 3.11+ check and install via deadsnakes if needed
+        _ensure_python311_linux
+
+    elif [ "$OS_TYPE" = "mac" ]; then
+        brew install curl wget git python@3.11 htop 2>/dev/null || true
+        PYTHON_BIN=$(brew --prefix)/bin/python3.11
+        _log "System packages installed"
+    fi
+
+    _log "System dependencies ready"
+}
+
+_ensure_python311_linux() {
+    # Check if python3.11+ already available
+    local pyver
+    pyver=$(python3 -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo "0")
+    local pymaj
+    pymaj=$(python3 -c 'import sys; print(sys.version_info.major)' 2>/dev/null || echo "0")
+
+    if [ "$pymaj" -ge 3 ] && [ "$pyver" -ge 11 ]; then
+        PYTHON_BIN=$(which python3)
+        _log "Python $(python3 --version) ready"
+        return
+    fi
+
+    _info "Python 3.11+ required, installing via deadsnakes PPA..."
+    sudo apt-get install -y software-properties-common -qq 2>/dev/null || true
+    sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
+    sudo apt-get update -qq 2>/dev/null
+    sudo apt-get install -y python3.11 python3.11-venv python3.11-dev python3.11-distutils 2>/dev/null || true
+
+    # Install pip for 3.11
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 2>/dev/null || true
+
+    # Make python3.11 the default python3 if possible
+    sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 2>/dev/null || true
+    PYTHON_BIN=$(which python3.11 2>/dev/null || which python3)
+    _log "Python $($PYTHON_BIN --version 2>&1) ready"
+}
+
+# ── Node via NVM ──────────────────────────────────────────────
+install_node() {
+    _section "Node.js + pnpm + PM2"
+
+    nvm_load
+    if command -v node &>/dev/null; then
+        local ver; ver=$(node -v | cut -d. -f1 | tr -d 'v')
+        if [ "$ver" -ge "$NODE_VERSION" ] 2>/dev/null; then
+            _log "Node.js $(node -v) already installed"
+            _ensure_pnpm_pm2
+            return
+        fi
+    fi
+
+    _info "Installing NVM..."
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh 2>/dev/null | bash
+    export NVM_DIR="$HOME/.nvm"
+    \. "$NVM_DIR/nvm.sh" 2>/dev/null
+
+    _info "Installing Node.js $NODE_VERSION..."
+    nvm install "$NODE_VERSION" 2>/dev/null
+    nvm alias default "$NODE_VERSION" 2>/dev/null
+    nvm use "$NODE_VERSION" 2>/dev/null
+    _log "Node.js $(node -v) ready"
+
+    _ensure_pnpm_pm2
+}
+
+_ensure_pnpm_pm2() {
+    nvm_load
+    command -v pnpm &>/dev/null || npm install -g pnpm 2>/dev/null
+    command -v pm2  &>/dev/null || npm install -g pm2  2>/dev/null
+    _log "pnpm $(pnpm -v 2>/dev/null) ready"
+    _log "PM2 $(pm2 -v 2>/dev/null) ready"
+}
+
+# ── Ollama ────────────────────────────────────────────────────
+install_ollama() {
+    _section "Ollama"
+    conf_load
+
+    if command -v ollama &>/dev/null; then
+        _log "Ollama already installed"
     else
-        _log "systemd=true already set"
+        _info "Installing Ollama..."
+        # zstd already installed above — this prevents the common install failure
+        if [ "$OS_TYPE" = "linux" ]; then
+            curl -fsSL https://ollama.com/install.sh 2>/dev/null | sh
+        elif [ "$OS_TYPE" = "mac" ]; then
+            brew install ollama 2>/dev/null || true
+        fi
+    fi
+
+    if ! command -v ollama &>/dev/null; then
+        _fail "Ollama"
+        return
+    fi
+
+    # Configure to listen on all interfaces
+    if [ "$OS_TYPE" = "linux" ]; then
+        sudo mkdir -p /etc/systemd/system/ollama.service.d
+        sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'EOF'
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0"
+EOF
+        sudo systemctl daemon-reload 2>/dev/null || true
+        sudo systemctl enable ollama 2>/dev/null || true
+        sudo systemctl restart ollama 2>/dev/null || (ollama serve > /dev/null 2>&1 &)
+    elif [ "$OS_TYPE" = "mac" ]; then
+        export OLLAMA_HOST=0.0.0.0
+        ollama serve > /dev/null 2>&1 &
+    fi
+
+    # Wait for Ollama to be ready
+    _info "Waiting for Ollama to start..."
+    local attempts=0
+    until curl -s "http://localhost:${AIOPS_PORT_OLLAMA}/api/tags" > /dev/null 2>&1; do
+        sleep 2
+        attempts=$((attempts + 1))
+        [ "$attempts" -ge 15 ] && { _fail "Ollama (timeout)"; return; }
+    done
+    _log "Ollama running on port ${AIOPS_PORT_OLLAMA}"
+
+    echo ""
+    echo -e "  ${BOLD}Recommended models for 8GB VRAM:${NC}"
+    echo ""
+    echo "  ollama pull nomic-embed-text     # Embeddings / RAG (274MB)"
+    echo "  ollama pull qwen3:4b             # General chat, fast (2.6GB)"
+    echo "  ollama pull qwen2.5:7b           # Writing, emails (4.7GB)"
+    echo "  ollama pull qwen2.5-coder:7b     # Code generation (4.7GB)"
+    echo "  ollama pull deepseek-r1:8b       # Reasoning, analysis (5.2GB)"
+    echo "  ollama pull llama3.1:8b          # Agent tool use (4.9GB)"
+    echo ""
+    echo -e "  ${YELLOW}Pull models after install using the commands above.${NC}"
+    echo -e "  ${YELLOW}Do not run more than one 7-8B model at the same time on 8GB VRAM.${NC}"
+    echo ""
+}
+
+# ── Qdrant ────────────────────────────────────────────────────
+install_qdrant() {
+    _section "Qdrant Vector Database"
+    conf_load
+
+    local qdrant_bin="$HOME/qdrant"
+
+    if [ ! -f "$qdrant_bin" ]; then
+        _info "Downloading Qdrant ${QDRANT_VERSION}..."
+        local arch="x86_64"
+        if [ "$OS_TYPE" = "mac" ]; then
+            arch=$(uname -m)  # x86_64 or arm64
+            curl -L "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-${arch}-apple-darwin.tar.gz" \
+                -o /tmp/qdrant.tar.gz 2>/dev/null
+        else
+            curl -L "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz" \
+                -o /tmp/qdrant.tar.gz 2>/dev/null
+        fi
+        tar -xzf /tmp/qdrant.tar.gz -C "$HOME" 2>/dev/null
+        rm -f /tmp/qdrant.tar.gz
+        chmod +x "$qdrant_bin"
+        _log "Qdrant binary ready"
+    else
+        _log "Qdrant binary already exists"
+    fi
+
+    mkdir -p "$QDRANT_DIR"/{config,static,storage,snapshots}
+
+    # Qdrant Web UI
+    if [ ! -f "$QDRANT_DIR/static/index.html" ]; then
+        _info "Downloading Qdrant Web UI..."
+        curl -L "https://github.com/qdrant/qdrant-web-ui/releases/download/${QDRANT_WEBUI_VERSION}/dist-qdrant.zip" \
+            -o /tmp/qdrant-webui.zip 2>/dev/null
+        unzip -q /tmp/qdrant-webui.zip -d /tmp/qdrant-webui-tmp 2>/dev/null
+        # Handle different zip structures
+        if [ -d "/tmp/qdrant-webui-tmp/dist" ]; then
+            cp -r /tmp/qdrant-webui-tmp/dist/. "$QDRANT_DIR/static/"
+        else
+            cp -r /tmp/qdrant-webui-tmp/. "$QDRANT_DIR/static/"
+        fi
+        rm -rf /tmp/qdrant-webui.zip /tmp/qdrant-webui-tmp
+        _log "Qdrant Web UI installed"
+    else
+        _log "Qdrant Web UI already exists"
+    fi
+
+    # Create launcher — sources config at runtime
+    cat > "$SCRIPTS_DIR/run-qdrant.sh" << QDSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+export QDRANT__SERVICE__STATIC_CONTENT_DIR="\${AIOPS_QDRANT_DIR}/static"
+export QDRANT__SERVICE__HTTP_PORT="\${AIOPS_PORT_QDRANT}"
+cd "\${AIOPS_QDRANT_DIR}"
+exec "\$HOME/qdrant"
+QDSCRIPT
+    chmod +x "$SCRIPTS_DIR/run-qdrant.sh"
+
+    _start_and_verify "qdrant" "$SCRIPTS_DIR/run-qdrant.sh" "$QDRANT_DIR" "${AIOPS_PORT_QDRANT}" "Qdrant"
+}
+
+# ── OpenWebUI ─────────────────────────────────────────────────
+# KEY FIX: Dedicated venv, launched via `python -m open_webui`.
+# No entry-point binary. No PATH issues. No binary discovery.
+# Venv Python path is absolute and fixed — PM2 calls it directly.
+install_openwebui() {
+    _section "OpenWebUI"
+    conf_load
+
+    local venv="$VENVS_DIR/openwebui"
+
+    if [ ! -d "$venv" ]; then
+        _info "Creating OpenWebUI venv..."
+        "$PYTHON_BIN" -m venv "$venv"
+        "$venv/bin/pip" install --upgrade pip setuptools wheel -q 2>/dev/null
+    fi
+
+    if ! "$venv/bin/python" -c "import open_webui" 2>/dev/null; then
+        _info "Installing OpenWebUI ${OPEN_WEBUI_VERSION} (this takes a few minutes)..."
+        "$venv/bin/pip" install "open-webui==${OPEN_WEBUI_VERSION}" -q 2>/dev/null
+        if ! "$venv/bin/python" -c "import open_webui" 2>/dev/null; then
+            # Try latest if pinned version fails
+            _warn "Pinned version failed, trying latest..."
+            "$venv/bin/pip" install open-webui -q 2>/dev/null
+        fi
+    else
+        _log "OpenWebUI already installed in venv"
+    fi
+
+    if ! "$venv/bin/python" -c "import open_webui" 2>/dev/null; then
+        _fail "OpenWebUI"
+        return
+    fi
+
+    # Launcher — uses venv Python directly, no binary, no PATH dependency
+    cat > "$SCRIPTS_DIR/run-openwebui.sh" << OWSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+
+# Use venv Python directly — no binary discovery, no PATH dependency
+VENV_PYTHON="${venv}/bin/python"
+
+if [ ! -x "\$VENV_PYTHON" ]; then
+    echo "[x] OpenWebUI venv Python not found at \$VENV_PYTHON"
+    echo "    Run: ${venv}/bin/pip install open-webui"
+    exit 1
+fi
+
+export VECTOR_DB=qdrant
+export QDRANT_URI="http://localhost:\${AIOPS_PORT_QDRANT}"
+export DATA_DIR="\$HOME/.local/share/open-webui"
+export PORT="\${AIOPS_PORT_OPENWEBUI}"
+
+exec "\$VENV_PYTHON" -m open_webui serve --port "\${AIOPS_PORT_OPENWEBUI}"
+OWSCRIPT
+    chmod +x "$SCRIPTS_DIR/run-openwebui.sh"
+
+    _start_and_verify "openwebui" "$SCRIPTS_DIR/run-openwebui.sh" "$HOME" "${AIOPS_PORT_OPENWEBUI}" "OpenWebUI"
+}
+
+# ── n8n ───────────────────────────────────────────────────────
+install_n8n() {
+    _section "n8n Workflow Automation"
+    conf_load
+    nvm_load
+
+    if ! command -v n8n &>/dev/null; then
+        _info "Installing n8n ${N8N_VERSION}..."
+        npm install -g "n8n@${N8N_VERSION}" 2>/dev/null \
+            || npm install -g n8n 2>/dev/null
+    else
+        _log "n8n already installed"
+    fi
+
+    if ! command -v n8n &>/dev/null; then
+        _fail "n8n"
+        return
+    fi
+
+    cat > "$SCRIPTS_DIR/run-n8n.sh" << N8NSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+export NVM_DIR="\$HOME/.nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
+export N8N_PORT="\${AIOPS_PORT_N8N}"
+export N8N_HOST=0.0.0.0
+export N8N_PROTOCOL=http
+export N8N_SECURE_COOKIE=false
+export N8N_EDITOR_BASE_URL="http://\${AIOPS_DOMAIN}/n8n"
+export WEBHOOK_URL="http://\${AIOPS_DOMAIN}/n8n/"
+export N8N_USER_FOLDER="\$HOME/.n8n"
+exec n8n start
+N8NSCRIPT
+    chmod +x "$SCRIPTS_DIR/run-n8n.sh"
+
+    _start_and_verify "n8n" "$SCRIPTS_DIR/run-n8n.sh" "$HOME" "${AIOPS_PORT_N8N}" "n8n"
+}
+
+# ── CrewAI + CrewAI Studio ────────────────────────────────────
+install_crewai() {
+    _section "CrewAI + CrewAI Studio"
+    conf_load
+
+    # ── CrewAI library venv ───────────────────────────────────
+    local crewai_venv="$VENVS_DIR/crewai"
+    if [ ! -d "$crewai_venv" ]; then
+        _info "Creating CrewAI venv..."
+        "$PYTHON_BIN" -m venv "$crewai_venv"
+        "$crewai_venv/bin/pip" install --upgrade pip -q 2>/dev/null
+    fi
+
+    if ! "$crewai_venv/bin/python" -c "import crewai" 2>/dev/null; then
+        _info "Installing CrewAI ${CREWAI_VERSION}..."
+        "$crewai_venv/bin/pip" install "crewai==${CREWAI_VERSION}" "crewai-tools==${CREWAI_TOOLS_VERSION}" -q 2>/dev/null \
+            || "$crewai_venv/bin/pip" install crewai crewai-tools -q 2>/dev/null
+        _log "CrewAI installed"
+    else
+        _log "CrewAI already installed"
+    fi
+
+    # ── CrewAI Studio venv ────────────────────────────────────
+    local studio_dir="$HOME/CrewAI-Studio"
+    local studio_venv="$studio_dir/venv"
+
+    if [ ! -d "$studio_dir" ]; then
+        _info "Cloning CrewAI Studio..."
+        git clone https://github.com/strnad/CrewAI-Studio.git "$studio_dir" 2>/dev/null
+    else
+        _log "CrewAI Studio already cloned"
+    fi
+
+    if [ ! -d "$studio_venv" ]; then
+        _info "Installing CrewAI Studio dependencies..."
+        cd "$studio_dir"
+        "$PYTHON_BIN" -m venv "$studio_venv"
+        "$studio_venv/bin/pip" install --upgrade pip -q 2>/dev/null
+
+        # FIX: Pin snowflake-connector-python to avoid yanked version warning/failure
+        # The yanked 4.1.0 version causes install issues — pin to last stable
+        "$studio_venv/bin/pip" install "snowflake-connector-python==3.12.4" -q 2>/dev/null || true
+
+        # Now install requirements — snowflake already satisfied, won't re-download yanked
+        if [ -f "requirements.txt" ]; then
+            "$studio_venv/bin/pip" install -r requirements.txt -q 2>/dev/null || \
+            "$studio_venv/bin/pip" install -r requirements.txt --no-deps -q 2>/dev/null || true
+        fi
+        cd "$HOME"
+        _log "CrewAI Studio dependencies installed"
+    else
+        _log "CrewAI Studio venv already exists"
+    fi
+
+    # ── Folder structure only, no sample scripts ──────────────
+    mkdir -p "$AGENTS_DIR"/{crews,tasks,tools,outputs,configs,knowledge}
+    _log "Agent folders created"
+
+    # ── Launcher ──────────────────────────────────────────────
+    cat > "$SCRIPTS_DIR/run-crewai-studio.sh" << CREWSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+cd "${studio_dir}"
+# Use venv Python directly — no PATH dependency
+exec "${studio_venv}/bin/python" -m streamlit run app/app.py \\
+    --server.port "\${AIOPS_PORT_CREWAI}" \\
+    --server.address 0.0.0.0 \\
+    --server.headless true \\
+    --server.baseUrlPath /agents
+CREWSCRIPT
+    chmod +x "$SCRIPTS_DIR/run-crewai-studio.sh"
+
+    _start_and_verify "crewai-studio" "$SCRIPTS_DIR/run-crewai-studio.sh" "$studio_dir" "${AIOPS_PORT_CREWAI}" "CrewAI Studio"
+}
+
+# ── Playwright ────────────────────────────────────────────────
+install_playwright() {
+    _section "Playwright"
+
+    local pw_venv="$VENVS_DIR/playwright"
+    if [ ! -d "$pw_venv" ]; then
+        "$PYTHON_BIN" -m venv "$pw_venv"
+        "$pw_venv/bin/pip" install --upgrade pip -q 2>/dev/null
+        "$pw_venv/bin/pip" install playwright requests -q 2>/dev/null
+        "$pw_venv/bin/playwright" install chromium 2>/dev/null || true
+        "$pw_venv/bin/playwright" install-deps chromium 2>/dev/null || true
+    fi
+
+    cat > "$SCRIPTS_DIR/run-playwright.sh" << PWSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+source "${pw_venv}/bin/activate"
+exec python3 "\$@"
+PWSCRIPT
+    chmod +x "$SCRIPTS_DIR/run-playwright.sh"
+    _log "Playwright ready"
+}
+
+# ── Optional AI Tools ─────────────────────────────────────────
+install_optional_tools() {
+    _section "Optional AI Tools"
+    echo ""
+    echo -e "  ${CYAN}Select which AI coding/agent tools to install.${NC}"
+    echo -e "  ${CYAN}Press Enter to skip any tool.${NC}"
+    echo ""
+
+    # Aider
+    echo -e "  ${BOLD}[1] Aider${NC} — AI pair programmer, works in your terminal"
+    if confirm "      Install Aider?" "n"; then
+        local aider_venv="$VENVS_DIR/aider"
+        "$PYTHON_BIN" -m venv "$aider_venv" 2>/dev/null
+        "$aider_venv/bin/pip" install --upgrade pip -q 2>/dev/null
+        "$aider_venv/bin/pip" install "aider-chat==${AIDER_VERSION}" -q 2>/dev/null \
+            || "$aider_venv/bin/pip" install aider-chat -q 2>/dev/null
+        cat > "$SCRIPTS_DIR/run-aider.sh" << AIDSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+source "${aider_venv}/bin/activate"
+exec aider "\$@"
+AIDSCRIPT
+        chmod +x "$SCRIPTS_DIR/run-aider.sh"
+        _log "Aider installed"
+    else
+        _info "Skipping Aider"
+    fi
+
+    # Open Interpreter
+    echo ""
+    echo -e "  ${BOLD}[2] Open Interpreter${NC} — lets AI run code on your computer"
+    if confirm "      Install Open Interpreter?" "n"; then
+        local oi_venv="$VENVS_DIR/interpreter"
+        "$PYTHON_BIN" -m venv "$oi_venv" 2>/dev/null
+        "$oi_venv/bin/pip" install --upgrade pip -q 2>/dev/null
+        "$oi_venv/bin/pip" install "open-interpreter==${OPEN_INTERPRETER_VERSION}" -q 2>/dev/null \
+            || "$oi_venv/bin/pip" install open-interpreter -q 2>/dev/null
+        cat > "$SCRIPTS_DIR/run-interpreter.sh" << OISCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+source "${oi_venv}/bin/activate"
+exec interpreter "\$@"
+OISCRIPT
+        chmod +x "$SCRIPTS_DIR/run-interpreter.sh"
+        _log "Open Interpreter installed"
+    else
+        _info "Skipping Open Interpreter"
+    fi
+
+    # OpenFang
+    echo ""
+    echo -e "  ${BOLD}[3] OpenFang${NC} — AI agent with browser, search and social hands"
+    if confirm "      Install OpenFang?" "n"; then
+        if curl -fsSL --max-time 15 https://openfang.sh/install -o /tmp/openfang-install.sh 2>/dev/null; then
+            bash /tmp/openfang-install.sh 2>/dev/null || true
+            rm -f /tmp/openfang-install.sh
+            export PATH="$HOME/.openfang/bin:$PATH"
+            if command -v openfang &>/dev/null; then
+                openfang hand activate lead      2>/dev/null || true
+                openfang hand activate browser   2>/dev/null || true
+                openfang hand activate researcher 2>/dev/null || true
+                openfang hand activate twitter   2>/dev/null || true
+                _log "OpenFang installed and hands activated"
+            else
+                _warn "OpenFang installed but binary not in PATH yet — restart shell to use"
+            fi
+        else
+            _warn "OpenFang installer not reachable — skipping"
+        fi
+    else
+        _info "Skipping OpenFang"
+    fi
+
+    # OpenClaw
+    echo ""
+    echo -e "  ${BOLD}[4] OpenClaw${NC} — AI computer use agent"
+    if confirm "      Install OpenClaw?" "n"; then
+        local oc_venv="$VENVS_DIR/openclaw"
+        "$PYTHON_BIN" -m venv "$oc_venv" 2>/dev/null
+        "$oc_venv/bin/pip" install --upgrade pip -q 2>/dev/null
+        "$oc_venv/bin/pip" install openclaw -q 2>/dev/null \
+            && { cat > "$SCRIPTS_DIR/run-openclaw.sh" << OCSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+source "${oc_venv}/bin/activate"
+exec openclaw "\$@"
+OCSCRIPT
+            chmod +x "$SCRIPTS_DIR/run-openclaw.sh"
+            _log "OpenClaw installed"; } \
+            || _warn "OpenClaw not available yet — skipping"
+    else
+        _info "Skipping OpenClaw"
     fi
 }
 
-# ── mDNS (Avahi) ──────────────────────────────────────────────
-setup_mdns() {
-    _section "Setting Up mDNS (Avahi)"
+# ── Caddy ─────────────────────────────────────────────────────
+# Installed AFTER all services verified — no 502s on startup
+install_caddy() {
+    _section "Caddy Reverse Proxy"
     conf_load
 
-    sudo apt-get install -y avahi-daemon avahi-utils libnss-mdns -qq
+    if ! command -v caddy &>/dev/null; then
+        if [ "$OS_TYPE" = "linux" ]; then
+            sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https -qq 2>/dev/null
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+                | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+                | sudo tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null 2>/dev/null
+            sudo apt-get update -qq 2>/dev/null
+            sudo apt-get install -y caddy 2>/dev/null
+        elif [ "$OS_TYPE" = "mac" ]; then
+            brew install caddy 2>/dev/null
+        fi
+        _log "Caddy installed: $(caddy version 2>/dev/null)"
+    else
+        _log "Caddy already installed: $(caddy version 2>/dev/null)"
+    fi
 
-    # hostname extracted from domain at runtime — no hardcoding
+    _write_caddyfile
+}
+
+_write_caddyfile() {
+    conf_load
+
+    sudo tee /etc/caddy/Caddyfile > /dev/null << CADDY
+# ============================================================
+# Caddyfile — Quantocos AI Labs — AIOPS v6.0.0
+# Regenerate: source ~/aiops-server/aiops.conf && aiops-caddy-regen
+# ============================================================
+
+:80 {
+
+    header {
+        Access-Control-Allow-Origin  "*"
+        Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+        Access-Control-Allow-Headers "*"
+        -X-Frame-Options
+        X-Content-Type-Options "nosniff"
+        -Server
+    }
+
+    # n8n — owns root on its port, Caddy strips prefix
+    handle /n8n* {
+        uri strip_prefix /n8n
+        reverse_proxy localhost:${AIOPS_PORT_N8N} {
+            header_up Host              {host}
+            header_up X-Real-IP         {remote_host}
+            header_up X-Forwarded-Proto http
+            header_up Upgrade           {http.upgrade}
+            header_up Connection        "Upgrade"
+        }
+    }
+
+    # CrewAI Studio — Streamlit with baseUrlPath=/agents
+    handle /agents* {
+        uri strip_prefix /agents
+        reverse_proxy localhost:${AIOPS_PORT_CREWAI} {
+            header_up Host       {host}
+            header_up Upgrade    {http.upgrade}
+            header_up Connection "Upgrade"
+        }
+    }
+
+    # Qdrant REST API via proxy — UI accessed directly at :PORT_QDRANT
+    handle /qdrant* {
+        uri strip_prefix /qdrant
+        reverse_proxy localhost:${AIOPS_PORT_QDRANT}
+    }
+
+    # Ollama API
+    handle /ollama* {
+        uri strip_prefix /ollama
+        reverse_proxy localhost:${AIOPS_PORT_OLLAMA}
+    }
+
+    # Netdata
+    handle /monitor* {
+        uri strip_prefix /monitor
+        reverse_proxy localhost:${AIOPS_PORT_NETDATA}
+    }
+
+    # OpenWebUI — catch-all (must be last)
+    handle /* {
+        reverse_proxy localhost:${AIOPS_PORT_OPENWEBUI} {
+            header_up Host      {host}
+            header_up X-Real-IP {remote_host}
+            header_up Upgrade   {http.upgrade}
+            header_up Connection "Upgrade"
+        }
+    }
+}
+CADDY
+
+    if sudo caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+        sudo systemctl enable caddy 2>/dev/null || true
+        sudo systemctl reload caddy 2>/dev/null || sudo systemctl restart caddy 2>/dev/null || true
+        _log "Caddyfile written and reloaded"
+    else
+        _warn "Caddyfile validation failed — check /etc/caddy/Caddyfile"
+    fi
+}
+
+# ── Avahi mDNS ────────────────────────────────────────────────
+setup_mdns() {
+    _section "Network Discovery"
+    conf_load
+
     local hostname="${AIOPS_DOMAIN%.local}"
 
-    sudo tee /etc/avahi/avahi-daemon.conf > /dev/null << AVAHI
+    if [ "$OS_TYPE" = "linux" ]; then
+        # Configure Avahi
+        sudo tee /etc/avahi/avahi-daemon.conf > /dev/null << AVAHI
 [server]
 host-name=${hostname}
 domain-name=local
 use-ipv4=yes
 use-ipv6=no
-allow-interfaces=eth0
+allow-interfaces=eth0,eth1,wlan0
 deny-interfaces=lo
 enable-dbus=yes
 check-response-ttl=no
@@ -292,725 +973,243 @@ publish-workstation=no
 publish-domain=yes
 AVAHI
 
-    grep -q "mdns4_minimal" /etc/nsswitch.conf 2>/dev/null \
-        || sudo sed -i 's/^hosts:.*/hosts:          files mdns4_minimal [NOTFOUND=return] dns/' /etc/nsswitch.conf
+        grep -q "mdns4_minimal" /etc/nsswitch.conf 2>/dev/null \
+            || sudo sed -i 's/^hosts:.*/hosts:          files mdns4_minimal [NOTFOUND=return] dns/' \
+               /etc/nsswitch.conf 2>/dev/null || true
 
-    sudo systemctl enable avahi-daemon 2>/dev/null || true
-    sudo systemctl restart avahi-daemon 2>/dev/null || true
-    _log "mDNS configured — hostname: ${hostname}"
-}
-
-# ── Caddy ─────────────────────────────────────────────────────
-# Caddyfile uses variables sourced from AIOPS_CONF via the
-# caddy-env wrapper. Ports are read from conf at caddy start.
-# For simplicity, Caddyfile is regenerated from conf values
-# since Caddy doesn't natively source shell env files.
-install_caddy() {
-    _section "Installing Caddy Reverse Proxy"
-    conf_load
-
-    if ! command -v caddy &>/dev/null; then
-        sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https -qq
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-            | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-            | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-        sudo apt-get update -qq
-        sudo apt-get install -y caddy
-        _log "Caddy installed: $(caddy version)"
-    else
-        _log "Caddy already installed: $(caddy version)"
+        sudo systemctl enable avahi-daemon 2>/dev/null || true
+        sudo systemctl restart avahi-daemon 2>/dev/null || true
     fi
 
-    write_caddyfile
-}
-
-# Separate function so it can be called standalone to regenerate
-# the Caddyfile when ports/domain change in aiops.conf
-write_caddyfile() {
-    conf_load
-
-    sudo tee /etc/caddy/Caddyfile > /dev/null << CADDY
-# ============================================================
-# /etc/caddy/Caddyfile — Quantocos AI Labs — AIOPS v5.3.0
-# Auto-generated from ${AIOPS_CONF}
-# Regenerate: aiops-caddy-regen (alias added to ~/.bashrc)
-# Architecture: per-port — no subpath proxying for WS apps
-# WebSocket: Connection "Upgrade" literal (not placeholder)
-# ============================================================
-
-:80 {
-
-    header {
-        Access-Control-Allow-Origin  "*"
-        Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
-        Access-Control-Allow-Headers "*"
-        -X-Frame-Options
-        X-Content-Type-Options "nosniff"
-        -Server
-    }
-
-    # n8n — strip prefix, n8n owns root on its port
-    handle /n8n* {
-        uri strip_prefix /n8n
-        reverse_proxy localhost:${AIOPS_PORT_N8N} {
-            header_up Host              {host}
-            header_up X-Real-IP         {remote_host}
-            header_up X-Forwarded-Proto http
-            header_up Upgrade           {http.upgrade}
-            header_up Connection        "Upgrade"
-        }
-    }
-
-    # CrewAI Studio — strip prefix, baseUrlPath set in launcher
-    handle /agents* {
-        uri strip_prefix /agents
-        reverse_proxy localhost:${AIOPS_PORT_CREWAI} {
-            header_up Host       {host}
-            header_up Upgrade    {http.upgrade}
-            header_up Connection "Upgrade"
-        }
-    }
-
-    # Qdrant REST API — UI accessed directly at :PORT_QDRANT
-    handle /qdrant* {
-        uri strip_prefix /qdrant
-        reverse_proxy localhost:${AIOPS_PORT_QDRANT}
-    }
-
-    # Netdata
-    handle /monitor* {
-        uri strip_prefix /monitor
-        reverse_proxy localhost:${AIOPS_PORT_NETDATA}
-    }
-
-    # Ollama API
-    handle /ollama* {
-        uri strip_prefix /ollama
-        reverse_proxy localhost:${AIOPS_PORT_OLLAMA}
-    }
-
-    # OpenWebUI — catch-all
-    handle /* {
-        reverse_proxy localhost:${AIOPS_PORT_OPENWEBUI} {
-            header_up Host      {host}
-            header_up X-Real-IP {remote_host}
-        }
-    }
-}
-CADDY
-
-    sudo caddy validate --config /etc/caddy/Caddyfile \
-        && sudo systemctl reload caddy 2>/dev/null || sudo systemctl restart caddy
-    _log "Caddyfile written and reloaded"
-}
-
-# ── Node via NVM ──────────────────────────────────────────────
-install_node() {
-    _section "Installing Node.js ${NODE_VERSION} via NVM"
-    nvm_load
-
-    if command -v node &>/dev/null; then
-        local current
-        current=$(node -v | cut -d. -f1 | tr -d 'v')
-        [ "$current" -ge "$NODE_VERSION" ] 2>/dev/null \
-            && { _log "Node.js $(node -v) already installed — skipping"; return; }
+    # Write /etc/hosts fallback — works everywhere including WSL2
+    # This ensures the domain always resolves even when mDNS fails
+    local hosts_entry="127.0.0.1 ${AIOPS_DOMAIN} ${AIOPS_DOMAIN%.local}"
+    if ! grep -q "${AIOPS_DOMAIN}" /etc/hosts 2>/dev/null; then
+        echo "$hosts_entry" | sudo tee -a /etc/hosts > /dev/null
+        _log "Added ${AIOPS_DOMAIN} to /etc/hosts"
     fi
 
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
-    export NVM_DIR="$HOME/.nvm"
-    \. "$NVM_DIR/nvm.sh"
-    nvm install "$NODE_VERSION"
-    nvm alias default "$NODE_VERSION"
-    nvm use "$NODE_VERSION"
-    _log "Node.js $(node -v) installed"
-    _log "npm $(npm -v) ready"
-}
-
-# ── pnpm ─────────────────────────────────────────────────────
-install_pnpm() {
-    _section "Installing pnpm"
-    nvm_load
-    command -v pnpm &>/dev/null \
-        && { _log "pnpm $(pnpm -v) already installed — skipping"; return; }
-    npm install -g pnpm
-    _log "pnpm $(pnpm -v) installed"
-}
-
-# ── PM2 ───────────────────────────────────────────────────────
-install_pm2() {
-    _section "Installing PM2"
-    nvm_load
-    command -v pm2 &>/dev/null \
-        && { _log "PM2 $(pm2 -v) already installed — skipping"; return; }
-    npm install -g pm2
-    _log "PM2 $(pm2 -v) installed"
-}
-
-# ── Ollama ────────────────────────────────────────────────────
-install_ollama() {
-    _section "Installing Ollama"
-    conf_load
-
-    command -v ollama &>/dev/null \
-        && { _log "Ollama already installed — skipping"; return; }
-
-    curl -fsSL https://ollama.com/install.sh | sh
-    command -v ollama &>/dev/null || _error "Ollama install failed."
-
-    sudo mkdir -p /etc/systemd/system/ollama.service.d
-    sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'EOF'
-[Service]
-Environment="OLLAMA_HOST=0.0.0.0"
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable ollama 2>/dev/null || true
-    sudo systemctl start ollama 2>/dev/null || (ollama serve &>/dev/null & sleep 3)
-    _log "Ollama installed — listening on 0.0.0.0:${AIOPS_PORT_OLLAMA}"
-    echo ""
-    echo -e "  ${YELLOW}Pull models after install:${NC}"
-    echo "  ollama pull nomic-embed-text      # embeddings/RAG"
-    echo "  ollama pull qwen3:4b              # fast chat   — 2.5GB"
-    echo "  ollama pull qwen2.5:7b            # general     — 4.7GB"
-    echo "  ollama pull qwen2.5-coder:7b      # coding      — 4.7GB"
-    echo "  ollama pull deepseek-r1:8b        # reasoning   — 5.2GB"
-    echo "  ollama pull llama3.1:8b           # agent tools — 4.9GB"
-    echo ""
-}
-
-# ── n8n ───────────────────────────────────────────────────────
-install_n8n() {
-    _section "Installing n8n"
-    nvm_load
-    command -v n8n &>/dev/null \
-        && { _log "n8n already installed — skipping"; return; }
-    npm install -g n8n
-    _log "n8n installed"
-}
-
-# ── OpenWebUI ─────────────────────────────────────────────────
-install_openwebui() {
-    _section "Installing OpenWebUI ${OPEN_WEBUI_VERSION}"
-    pip show open-webui &>/dev/null 2>&1 \
-        && { _log "OpenWebUI already installed — skipping"; return; }
-    # shellcheck disable=SC2086
-    pip install "open-webui==${OPEN_WEBUI_VERSION}" $PIP_FLAGS
-    # shellcheck disable=SC2086
-    pip install qdrant-client $PIP_FLAGS
-    export PATH="$HOME/.local/bin:$PATH"
-    _log "OpenWebUI ${OPEN_WEBUI_VERSION} installed"
-}
-
-# ── Qdrant ────────────────────────────────────────────────────
-install_qdrant() {
-    _section "Installing Qdrant ${QDRANT_VERSION}"
-    local qdrant_bin="$HOME/qdrant"
-
-    if [ ! -f "$qdrant_bin" ]; then
-        curl -L "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz" \
-            -o /tmp/qdrant.tar.gz
-        tar -xzf /tmp/qdrant.tar.gz -C "$HOME"
-        rm /tmp/qdrant.tar.gz
-        chmod +x "$qdrant_bin"
-        _log "Qdrant binary downloaded"
-    else
-        _log "Qdrant binary already exists"
-    fi
-
-    if [ ! -f "$QDRANT_DIR/static/index.html" ]; then
-        curl -L "https://github.com/qdrant/qdrant-web-ui/releases/download/${QDRANT_WEBUI_VERSION}/dist-qdrant.zip" \
-            -o /tmp/qdrant-webui.zip
-        sudo apt-get install -y unzip -qq
-        unzip -q /tmp/qdrant-webui.zip -d /tmp/qdrant-webui-temp
-        cp -r /tmp/qdrant-webui-temp/dist/. "$QDRANT_DIR/static/"
-        rm -rf /tmp/qdrant-webui.zip /tmp/qdrant-webui-temp
-        _log "Qdrant Web UI installed"
-    else
-        _log "Qdrant Web UI already exists"
-    fi
-}
-
-# ── Python Venvs ──────────────────────────────────────────────
-setup_venvs() {
-    _section "Setting Up Python Virtual Environments"
-
-    _make_venv() {
-        local name="$1"; shift
-        local dir="$VENVS_DIR/$name"
-        if [ ! -d "$dir" ]; then
-            python3 -m venv "$dir"
-            "$dir/bin/pip" install --upgrade pip -q
-            "$dir/bin/pip" install "$@" -q
-            _log "$name venv ready"
+    # WSL2: also write to Windows hosts file for browser access from Windows
+    if $IS_WSL; then
+        local win_hosts="/mnt/c/Windows/System32/drivers/etc/hosts"
+        if [ -w "$win_hosts" ] 2>/dev/null; then
+            if ! grep -q "${AIOPS_DOMAIN}" "$win_hosts" 2>/dev/null; then
+                echo "$hosts_entry" >> "$win_hosts" 2>/dev/null
+                _log "Added ${AIOPS_DOMAIN} to Windows hosts file"
+            fi
         else
-            _log "$name venv already exists"
+            _warn "Cannot write to Windows hosts file — run this in PowerShell as Admin:"
+            _warn "  Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts '127.0.0.1 ${AIOPS_DOMAIN}'"
         fi
-    }
-
-    _make_venv crewai      "crewai==${CREWAI_VERSION}" "crewai-tools==${CREWAI_TOOLS_VERSION}"
-    _make_venv aider       "aider-chat==${AIDER_VERSION}"
-    _make_venv interpreter "open-interpreter==${OPEN_INTERPRETER_VERSION}"
-    _make_venv scrapy      scrapy pandas dedupe email-validator phonenumbers tqdm python-dotenv
-    _make_venv playwright  playwright requests dnspython
-
-    if [ ! -d "$VENVS_DIR/playwright/lib" ] || \
-       ! "$VENVS_DIR/playwright/bin/playwright" show-trace --help &>/dev/null 2>&1; then
-        "$VENVS_DIR/playwright/bin/playwright" install chromium
-        "$VENVS_DIR/playwright/bin/playwright" install-deps chromium
-        _log "Playwright chromium installed"
-    fi
-}
-
-# ── CrewAI Studio ─────────────────────────────────────────────
-install_crewai_studio() {
-    _section "Installing CrewAI Studio"
-    local studio_dir="$HOME/CrewAI-Studio"
-
-    if [ ! -d "$studio_dir" ]; then
-        git clone https://github.com/strnad/CrewAI-Studio.git "$studio_dir"
-        _log "CrewAI Studio cloned"
-    else
-        _log "CrewAI Studio already cloned"
     fi
 
-    if [ ! -d "$studio_dir/venv" ]; then
-        cd "$studio_dir"
-        python3 -m venv venv
-        source venv/bin/activate
-        pip install --upgrade pip -q
-        pip install -r requirements.txt -q
-        deactivate
-        cd "$HOME"
-        _log "CrewAI Studio dependencies installed"
-    else
-        _log "CrewAI Studio venv already exists"
+    _log "mDNS + hosts fallback configured for ${AIOPS_DOMAIN}"
+}
+
+# ── PM2 startup + save ────────────────────────────────────────
+setup_pm2_startup() {
+    _section "PM2 Process Management"
+    nvm_load
+
+    pm2 save 2>/dev/null || true
+
+    # Set up PM2 to start on system boot
+    if [ "$OS_TYPE" = "linux" ]; then
+        local startup_cmd
+        startup_cmd=$(pm2 startup systemd -u "$USER" --hp "$HOME" 2>/dev/null | grep "sudo env")
+        if [ -n "$startup_cmd" ]; then
+            eval "$startup_cmd" 2>/dev/null || true
+        fi
+    elif [ "$OS_TYPE" = "mac" ]; then
+        pm2 startup 2>/dev/null | tail -1 | bash 2>/dev/null || true
     fi
+
+    pm2 save 2>/dev/null || true
+    _log "PM2 startup configured"
 }
 
-# ── Launcher Scripts ──────────────────────────────────────────
-# ALL launchers source $AIOPS_CONF at runtime.
-# No ports, domains, IPs, or usernames are hardcoded in launcher text.
-# Runtime IP discovery for anything that needs the LAN address.
-create_launchers() {
-    _section "Creating Launcher Scripts"
-    conf_load
-
-    local studio_dir="$HOME/CrewAI-Studio"
-    local conf_path="$AIOPS_CONF"
-
-    # ── OpenWebUI ─────────────────────────────────────────────
-    # Binary discovery at runtime — handles any username, any
-    # Python version, any pip install location. Never hardcoded.
-    cat > "$SCRIPTS_DIR/run-openwebui.sh" << OWSCRIPT
-#!/bin/bash
-source "${conf_path}"
-
-export PATH="\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-export VECTOR_DB=qdrant
-export QDRANT_URI="http://localhost:\${AIOPS_PORT_QDRANT}"
-export DATA_DIR="\$HOME/.local/share/open-webui"
-
-# Runtime binary discovery — no hardcoded paths
-_find_owu() {
-    [ -x "\$HOME/.local/bin/open-webui" ] && echo "\$HOME/.local/bin/open-webui" && return
-    for pyver in 3.13 3.12 3.11 3.10; do
-        local p="\$HOME/.local/lib/python\${pyver}/site-packages/../../../bin/open-webui"
-        [ -x "\$p" ] && echo "\$p" && return
-    done
-    [ -x "/usr/local/bin/open-webui" ] && echo "/usr/local/bin/open-webui" && return
-    command -v open-webui 2>/dev/null
-}
-
-OWU_BIN=\$(_find_owu)
-if [ -z "\$OWU_BIN" ]; then
-    echo "[✗] open-webui binary not found"
-    echo "    Reinstall: pip install open-webui --break-system-packages"
-    exit 1
-fi
-
-echo "[→] open-webui: \$OWU_BIN  port: \${AIOPS_PORT_OPENWEBUI}"
-exec "\$OWU_BIN" serve --port "\${AIOPS_PORT_OPENWEBUI}"
-OWSCRIPT
-
-    # ── n8n ───────────────────────────────────────────────────
-    # Domain and port sourced from conf at runtime.
-    # N8N_EDITOR_BASE_URL uses AIOPS_DOMAIN from conf — not hardcoded.
-    cat > "$SCRIPTS_DIR/run-n8n.sh" << 'N8NHEAD'
-#!/bin/bash
-N8NHEAD
-    cat >> "$SCRIPTS_DIR/run-n8n.sh" << N8NBODY
-source "${conf_path}"
-export NVM_DIR="\$HOME/.nvm"
-[ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
-export N8N_PORT="\${AIOPS_PORT_N8N}"
-export N8N_HOST=0.0.0.0
-export N8N_PROTOCOL=http
-export N8N_SECURE_COOKIE=false
-export N8N_EDITOR_BASE_URL="http://\${AIOPS_DOMAIN}/n8n"
-export WEBHOOK_URL="http://\${AIOPS_DOMAIN}/n8n/"
-export N8N_USER_FOLDER="\$HOME/.n8n"
-exec n8n start
-N8NBODY
-
-    # ── Qdrant ────────────────────────────────────────────────
-    cat > "$SCRIPTS_DIR/run-qdrant.sh" << QDRANTSCRIPT
-#!/bin/bash
-source "${conf_path}"
-export QDRANT__SERVICE__STATIC_CONTENT_DIR="\${AIOPS_QDRANT_DIR}/static"
-export QDRANT__SERVICE__HTTP_PORT="\${AIOPS_PORT_QDRANT}"
-cd "\${AIOPS_QDRANT_DIR}"
-exec "\$HOME/qdrant"
-QDRANTSCRIPT
-
-    # ── CrewAI Studio ─────────────────────────────────────────
-    # --server.baseUrlPath sourced from port config — always /agents
-    # which matches the Caddyfile handle block
-    cat > "$SCRIPTS_DIR/run-crewai-studio.sh" << CREWSCRIPT
-#!/bin/bash
-source "${conf_path}"
-cd "${studio_dir}"
-exec "${studio_dir}/venv/bin/streamlit" run app/app.py \\
-    --server.port "\${AIOPS_PORT_CREWAI}" \\
-    --server.address 0.0.0.0 \\
-    --server.headless true \\
-    --server.baseUrlPath /agents
-CREWSCRIPT
-
-    # ── AI tool launchers (source conf for venv path) ─────────
-    cat > "$SCRIPTS_DIR/run-aider.sh" << AIDSCRIPT
-#!/bin/bash
-source "${conf_path}"
-source "\${AIOPS_VENVS_DIR}/aider/bin/activate"
-MODEL="\${1:-ollama/qwen2.5-coder:7b}"
-exec aider --model "\$MODEL" "\${@:2}"
-AIDSCRIPT
-
-    cat > "$SCRIPTS_DIR/run-crew.sh" << CREWRSCRIPT
-#!/bin/bash
-source "${conf_path}"
-source "\${AIOPS_VENVS_DIR}/crewai/bin/activate"
-exec python3 "\$@"
-CREWRSCRIPT
-
-    cat > "$SCRIPTS_DIR/run-interpreter.sh" << INTRSCRIPT
-#!/bin/bash
-source "${conf_path}"
-source "\${AIOPS_VENVS_DIR}/interpreter/bin/activate"
-MODEL="\${1:-ollama/llama3.1:8b}"
-exec interpreter --model "\$MODEL"
-INTRSCRIPT
-
-    cat > "$SCRIPTS_DIR/run-scrapy.sh" << SCRAPYSCRIPT
-#!/bin/bash
-source "${conf_path}"
-source "\${AIOPS_VENVS_DIR}/scrapy/bin/activate"
-exec python3 "\$@"
-SCRAPYSCRIPT
-
-    cat > "$SCRIPTS_DIR/run-playwright.sh" << PWSCRIPT
-#!/bin/bash
-source "${conf_path}"
-source "\${AIOPS_VENVS_DIR}/playwright/bin/activate"
-exec python3 "\$@"
-PWSCRIPT
-
-    chmod +x "$SCRIPTS_DIR"/*.sh
-    _log "Launcher scripts created — all source $AIOPS_CONF at runtime"
-}
-
-# ── Shell Aliases ─────────────────────────────────────────────
+# ── Shell aliases ─────────────────────────────────────────────
 setup_aliases() {
-    _section "Setting Up Shell Aliases"
+    _section "Shell Aliases"
     conf_load
 
-    sed -i '/# AIOPS START/,/# AIOPS END/d' ~/.bashrc
+    # Remove any previous AIOPS block
+    sed -i '/# AIOPS START/,/# AIOPS END/d' ~/.bashrc 2>/dev/null || true
+    [ -f ~/.zshrc ] && sed -i '/# AIOPS START/,/# AIOPS END/d' ~/.zshrc 2>/dev/null || true
 
-    cat >> ~/.bashrc << BASHRC
+    local alias_block
+    alias_block=$(cat << ALIASES
 
-# AIOPS START — Quantocos AI Labs v5.3.0
+# AIOPS START — Quantocos AI Labs v6.0.0
 export PATH="\$HOME/.local/bin:\$HOME/.openfang/bin:\$PATH"
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
-
-# Load AIOPS config
 [ -f "${AIOPS_CONF}" ] && source "${AIOPS_CONF}"
 
-# Service management
 alias ai-status='pm2 status'
 alias ai-start='pm2 resurrect'
 alias ai-stop='pm2 stop all'
 alias ai-restart='pm2 restart all'
 alias ai-logs='pm2 logs'
 alias ai-config='nano ${AIOPS_CONF}'
-alias aiops-caddy-regen='source ${AIOPS_CONF} && bash -c "$(declare -f write_caddyfile conf_load _log _warn _info _section)" && write_caddyfile'
-
-# AI tools
-alias aider='${SCRIPTS_DIR}/run-aider.sh'
-alias crew='${SCRIPTS_DIR}/run-crew.sh'
-alias interpreter='${SCRIPTS_DIR}/run-interpreter.sh'
-alias scrape='${SCRIPTS_DIR}/run-scrapy.sh'
-alias automate='${SCRIPTS_DIR}/run-playwright.sh'
-
-# Chat (model names not hardcoded — use ollama list to see what you've pulled)
-alias chat='ollama run qwen3:4b'
-alias chat-coder='ollama run qwen2.5-coder:7b'
-alias chat-reason='ollama run deepseek-r1:8b'
+alias aiops-caddy-regen='source ${AIOPS_CONF} && _write_caddyfile'
 alias models='ollama list'
+alias chat='ollama run qwen3:4b'
+alias ai-urls='source ${AIOPS_CONF} && echo "" && echo "  OpenWebUI   http://\${AIOPS_DOMAIN}" && echo "  n8n         http://\${AIOPS_DOMAIN}/n8n" && echo "  Qdrant      http://localhost:\${AIOPS_PORT_QDRANT}" && echo "  CrewAI      http://\${AIOPS_DOMAIN}/agents" && echo "  Ollama      http://localhost:\${AIOPS_PORT_OLLAMA}" && echo ""'
 
-# Service URLs — read from config at shell open, always accurate
-alias ai-urls='source ${AIOPS_CONF} && LOCAL_IP=\$(ip route get 1 2>/dev/null | awk "{print \$7; exit}") && echo "OpenWebUI  http://\${LOCAL_IP}:\${AIOPS_PORT_OPENWEBUI}" && echo "n8n        http://\${AIOPS_DOMAIN}/n8n" && echo "Qdrant     http://\${LOCAL_IP}:\${AIOPS_PORT_QDRANT}" && echo "Agents     http://\${AIOPS_DOMAIN}/agents" && echo "Ollama     http://\${LOCAL_IP}:\${AIOPS_PORT_OLLAMA}"'
+[ -x "${SCRIPTS_DIR}/run-aider.sh" ]       && alias aider='${SCRIPTS_DIR}/run-aider.sh'
+[ -x "${SCRIPTS_DIR}/run-interpreter.sh" ] && alias interpreter='${SCRIPTS_DIR}/run-interpreter.sh'
+[ -x "${SCRIPTS_DIR}/run-playwright.sh" ]  && alias automate='${SCRIPTS_DIR}/run-playwright.sh'
+[ -x "${SCRIPTS_DIR}/run-openclaw.sh" ]    && alias openclaw='${SCRIPTS_DIR}/run-openclaw.sh'
 
-# PM2 auto-resurrect
-[[ -z \$(pm2 list 2>/dev/null | grep online) ]] && pm2 resurrect 2>/dev/null
-
+[[ -z \$(pm2 list 2>/dev/null | grep online) ]] && pm2 resurrect 2>/dev/null || true
 # AIOPS END
-BASHRC
+ALIASES
+)
 
-    _log "Shell aliases written to ~/.bashrc"
+    echo "$alias_block" >> ~/.bashrc
+    [ -f ~/.zshrc ] && echo "$alias_block" >> ~/.zshrc
+
+    _log "Aliases written"
 }
 
-# ── PM2 Services ──────────────────────────────────────────────
-setup_pm2_services() {
-    _section "Configuring PM2 Services"
+# ── Service helper: start via PM2 and verify port ─────────────
+# Never proceeds if a previous critical service failed.
+# Tries to start, waits for port, marks failure if timeout.
+_start_and_verify() {
+    local pm2_name="$1"
+    local script="$2"
+    local cwd="$3"
+    local port="$4"
+    local label="$5"
+
     nvm_load
-    conf_load
 
-    pm2 kill 2>/dev/null || true
-    rm -f ~/.pm2/dump.pm2 2>/dev/null || true
-    sleep 2
+    # Stop existing instance cleanly
+    pm2 delete "$pm2_name" 2>/dev/null || true
+    sleep 1
 
-    # Clear ports using values from config — not hardcoded numbers
-    for port in "$AIOPS_PORT_N8N" "$AIOPS_PORT_OPENWEBUI" "$AIOPS_PORT_QDRANT" "$AIOPS_PORT_CREWAI"; do
-        sudo fuser -k "${port}/tcp" 2>/dev/null || true
+    # Kill anything on the port
+    sudo fuser -k "${port}/tcp" 2>/dev/null || true
+    sleep 1
+
+    _info "Starting ${label}..."
+    pm2 start "$script" --name "$pm2_name" --cwd "$cwd" 2>/dev/null
+
+    # Wait for port to respond
+    local attempts=0
+    local max=30  # 60 seconds max
+    while ! curl -s "http://localhost:${port}" > /dev/null 2>&1 \
+       && ! curl -s "http://localhost:${port}/api/tags" > /dev/null 2>&1 \
+       && ! curl -s "http://localhost:${port}/healthz" > /dev/null 2>&1; do
+        sleep 2
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge "$max" ]; then
+            _fail "${label} (port ${port} not responding)"
+            pm2 logs "$pm2_name" --lines 10 --nostream 2>/dev/null | tail -10
+            return 1
+        fi
     done
-    sleep 2
 
-    pm2 start "$SCRIPTS_DIR/run-n8n.sh"          --name n8n
-    pm2 start "$SCRIPTS_DIR/run-openwebui.sh"     --name openwebui
-    pm2 start "$SCRIPTS_DIR/run-qdrant.sh"        --name qdrant --cwd "$QDRANT_DIR"
-    pm2 start "$SCRIPTS_DIR/run-crewai-studio.sh" --name crewai-studio
-
-    sleep 5
-    pm2 save
-    _log "PM2 services started and saved"
-}
-
-# ── Sample crew ───────────────────────────────────────────────
-create_sample_crew() {
-    _section "Creating Sample Files"
-    conf_load
-
-    cat > "$AGENTS_DIR/crews/sample_crew.py" << 'PYEOF'
-"""
-Sample CrewAI crew — Quantocos AI Labs
-Reads Ollama port from AIOPS config at runtime.
-Run: crew ~/agents/crews/sample_crew.py
-"""
-import os
-import subprocess
-
-def get_ollama_url():
-    """Read port from aiops.conf rather than hardcoding it."""
-    conf = os.path.expanduser("~/aiops-server/aiops.conf")
-    port = "11434"  # fallback default
-    if os.path.exists(conf):
-        with open(conf) as f:
-            for line in f:
-                if line.startswith("AIOPS_PORT_OLLAMA="):
-                    port = line.strip().split("=", 1)[1].strip('"')
-    return f"http://localhost:{port}"
-
-from crewai import Agent, Task, Crew, LLM
-
-llm = LLM(model="ollama/llama3.1:8b", base_url=get_ollama_url())
-
-researcher = Agent(
-    role="Research Analyst",
-    goal="Research and summarize information accurately",
-    backstory="Expert researcher with attention to detail",
-    llm=llm, verbose=True
-)
-writer = Agent(
-    role="Content Writer",
-    goal="Write clear, engaging content",
-    backstory="Professional business content writer",
-    llm=llm, verbose=True
-)
-
-research_task = Task(
-    description="List 3 benefits of local AI for small businesses",
-    expected_output="3 bullet points, one sentence each",
-    agent=researcher
-)
-write_task = Task(
-    description="Write a 100 word LinkedIn post from the research",
-    expected_output="A ready-to-post LinkedIn update",
-    agent=writer
-)
-
-crew = Crew(agents=[researcher, writer], tasks=[research_task, write_task], verbose=True)
-
-if __name__ == "__main__":
-    result = crew.kickoff()
-    print("\n=== OUTPUT ===")
-    print(result)
-PYEOF
-
-    _log "Sample crew: $AGENTS_DIR/crews/sample_crew.py"
-}
-
-# ── Core install summary ──────────────────────────────────────
-print_core_summary() {
-    _section "Core Install Complete"
-    conf_load
-
-    # IP discovered at print time — not stored
-    local local_ip
-    local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || echo "YOUR_IP")
-
-    echo -e "${BOLD}${GREEN}"
-    echo "  ╔══════════════════════════════════════════════════════════╗"
-    echo "  ║   AIOPS v5.3.0 — CORE STACK READY                       ║"
-    echo "  ╠══════════════════════════════════════════════════════════╣"
-    echo "  ║   Service         Port                                   ║"
-    echo "  ║   ─────────────── ──────────────────────────────────     ║"
-    printf "  ║   OpenWebUI       http://%-33s║\n" "${local_ip}:${AIOPS_PORT_OPENWEBUI}"
-    printf "  ║   n8n             http://%-33s║\n" "${AIOPS_DOMAIN}/n8n"
-    printf "  ║   Qdrant UI       http://%-33s║\n" "${local_ip}:${AIOPS_PORT_QDRANT}"
-    printf "  ║   CrewAI Studio   http://%-33s║\n" "${AIOPS_DOMAIN}/agents"
-    printf "  ║   Ollama          http://%-33s║\n" "${local_ip}:${AIOPS_PORT_OLLAMA}"
-    echo "  ╠══════════════════════════════════════════════════════════╣"
-    printf "  ║   Config:  %-46s║\n" "${AIOPS_CONF}"
-    echo "  ╚══════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-
-    echo -e "${BOLD}Next Steps:${NC}"
-    echo "  1. Pull a model:   ollama pull qwen3:4b"
-    echo "  2. Reload shell:   source ~/.bashrc"
-    echo "  3. Check status:   ai-status"
-    echo "  4. Show URLs:      ai-urls"
-    echo "  5. Edit config:    ai-config"
-    echo ""
-    echo -e "${CYAN}Config: $AIOPS_CONF${NC}"
-    echo -e "${CYAN}Log:    $LOG_FILE${NC}"
-    echo ""
+    _log "${label} running on port ${port}"
+    pm2 save 2>/dev/null || true
+    return 0
 }
 
 # ============================================================
-# PART 2 — ADDONS LOOP
+# ADDONS
 # ============================================================
 
-addon_dependencies() {
-    _section_add "Installing Shared Dependencies"
-    conf_load
-
+_ensure_shared_deps() {
+    # PostgreSQL
     if ! command -v psql &>/dev/null; then
-        sudo apt-get update -qq
-        sudo apt-get install -y postgresql postgresql-contrib
-        sudo systemctl enable postgresql && sudo systemctl start postgresql
-        _log_add "PostgreSQL installed"
-    else
-        _log_add "PostgreSQL already installed"
+        _info "Installing PostgreSQL..."
+        if [ "$OS_TYPE" = "linux" ]; then
+            sudo apt-get install -y postgresql postgresql-contrib -qq 2>/dev/null
+            sudo systemctl enable postgresql 2>/dev/null || true
+            sudo systemctl start postgresql 2>/dev/null || true
+        elif [ "$OS_TYPE" = "mac" ]; then
+            brew install postgresql@15 2>/dev/null
+            brew services start postgresql@15 2>/dev/null || true
+        fi
+        _log_add "PostgreSQL ready"
     fi
 
+    # Redis
     if ! command -v redis-server &>/dev/null; then
-        sudo apt-get install -y redis-server
-        sudo systemctl enable redis-server && sudo systemctl start redis-server
-        _log_add "Redis installed"
-    else
-        _log_add "Redis already installed"
-    fi
-
-    if [ ! -d "$VENVS_DIR/firecrawl" ]; then
-        python3 -m venv "$VENVS_DIR/firecrawl"
-        "$VENVS_DIR/firecrawl/bin/pip" install --upgrade pip -q
-        "$VENVS_DIR/firecrawl/bin/pip" install firecrawl-py -q
-        cat > "$SCRIPTS_DIR/run-firecrawl.sh" << FSCRIPT
-#!/bin/bash
-source "${AIOPS_CONF}"
-source "\${AIOPS_VENVS_DIR}/firecrawl/bin/activate"
-exec python3 "\$@"
-FSCRIPT
-        chmod +x "$SCRIPTS_DIR/run-firecrawl.sh"
-        _log_add "Firecrawl venv ready"
-    else
-        _log_add "Firecrawl venv already exists"
+        _info "Installing Redis..."
+        if [ "$OS_TYPE" = "linux" ]; then
+            sudo apt-get install -y redis-server -qq 2>/dev/null
+            sudo systemctl enable redis-server 2>/dev/null || true
+            sudo systemctl start redis-server 2>/dev/null || true
+        elif [ "$OS_TYPE" = "mac" ]; then
+            brew install redis 2>/dev/null
+            brew services start redis 2>/dev/null || true
+        fi
+        _log_add "Redis ready"
     fi
 }
 
 addon_twenty_crm() {
-    _section_add "Installing Twenty CRM"
+    _section_add "Twenty CRM"
     conf_load
     nvm_load
+    _ensure_shared_deps
 
-    local twenty_dir="$HOME/twenty"
-
-    [ ! -d "$twenty_dir" ] \
-        && git clone https://github.com/twentyhq/twenty.git "$twenty_dir" \
-        && _log_add "Twenty CRM cloned" \
-        || _log_add "Twenty CRM already cloned"
+    local dir="$HOME/twenty"
+    [ ! -d "$dir" ] && git clone https://github.com/twentyhq/twenty.git "$dir" 2>/dev/null
 
     sudo -u postgres psql -lqt 2>/dev/null | grep -q twenty || {
         sudo -u postgres psql -c "CREATE USER twenty WITH PASSWORD 'twenty_password';" 2>/dev/null || true
         sudo -u postgres psql -c "CREATE DATABASE twenty OWNER twenty;" 2>/dev/null || true
-        _log_add "Twenty CRM database created"
     }
 
-    cd "$twenty_dir"
+    cd "$dir"
     [ ! -f ".env" ] && {
         local secret; secret=$(openssl rand -base64 24 | tr -d '=+/' | head -c 32)
-        cat > .env << ENVEOF
+        cat > .env << TENV
 APP_SECRET=${secret}
 DATABASE_URL=postgresql://twenty:twenty_password@localhost:5432/twenty
 FRONT_BASE_URL=http://localhost:${AIOPS_PORT_TWENTY}
 REDIS_URL=redis://localhost:6379
-ENVEOF
-        _log_add ".env configured"
+TENV
     }
 
-    _info_add "Installing via pnpm (monorepo — npm will not work)..."
-    pnpm install
+    _info "Installing Twenty CRM (pnpm — this takes a few minutes)..."
+    pnpm install 2>/dev/null || true
 
     cat > "$SCRIPTS_DIR/run-twenty.sh" << TSCRIPT
 #!/bin/bash
 source "${AIOPS_CONF}"
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
-cd "${twenty_dir}"
+cd "${dir}"
 exec pnpm nx start
 TSCRIPT
     chmod +x "$SCRIPTS_DIR/run-twenty.sh"
-    pm2 start "$SCRIPTS_DIR/run-twenty.sh" --name twenty 2>/dev/null || true
-    pm2 save
+    _start_and_verify "twenty" "$SCRIPTS_DIR/run-twenty.sh" "$dir" "${AIOPS_PORT_TWENTY}" "Twenty CRM"
     cd "$HOME"
-
-    _log_add "Twenty CRM installed"
-    local local_ip; local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
-    echo "  → http://${local_ip}:${AIOPS_PORT_TWENTY}"
 }
 
 addon_listmonk() {
-    _section_add "Installing Listmonk"
+    _section_add "Listmonk Email Campaigns"
     conf_load
+    _ensure_shared_deps
 
-    local lm_bin="$HOME/listmonk"
-    local lm_dir="$HOME/listmonk-data"
-    mkdir -p "$lm_dir"
+    local bin="$HOME/listmonk"
+    local dir="$HOME/listmonk-data"
+    mkdir -p "$dir"
 
-    if [ ! -f "$lm_bin" ]; then
-        local lm_url
-        lm_url=$(curl -s https://api.github.com/repos/knadh/listmonk/releases/latest \
+    if [ ! -f "$bin" ]; then
+        local url
+        url=$(curl -s https://api.github.com/repos/knadh/listmonk/releases/latest \
             | grep "browser_download_url.*linux_amd64.tar.gz" | cut -d'"' -f4 | head -1)
-        [ -z "$lm_url" ] && lm_url="https://github.com/knadh/listmonk/releases/download/v4.1.0/listmonk_4.1.0_linux_amd64.tar.gz"
-        curl -L "$lm_url" -o /tmp/listmonk.tar.gz
-        tar -xzf /tmp/listmonk.tar.gz -C /tmp/
-        mv /tmp/listmonk "$lm_bin" 2>/dev/null \
-            || find /tmp -name "listmonk" -type f | head -1 | xargs -I{} mv {} "$lm_bin"
-        chmod +x "$lm_bin"
+        [ -z "$url" ] && url="https://github.com/knadh/listmonk/releases/download/v4.1.0/listmonk_4.1.0_linux_amd64.tar.gz"
+        curl -L "$url" -o /tmp/listmonk.tar.gz 2>/dev/null
+        tar -xzf /tmp/listmonk.tar.gz -C /tmp/ 2>/dev/null
+        find /tmp -maxdepth 2 -name "listmonk" -type f 2>/dev/null | head -1 | xargs -I{} mv {} "$bin"
+        chmod +x "$bin"
         rm -f /tmp/listmonk.tar.gz
-        _log_add "Listmonk binary downloaded"
-    else
-        _log_add "Listmonk binary already exists"
     fi
 
     sudo -u postgres psql -lqt 2>/dev/null | grep -q listmonk || {
@@ -1018,8 +1217,8 @@ addon_listmonk() {
         sudo -u postgres psql -c "CREATE DATABASE listmonk OWNER listmonk;" 2>/dev/null || true
     }
 
-    if [ ! -f "$lm_dir/config.toml" ]; then
-        cat > "$lm_dir/config.toml" << TOML
+    [ ! -f "$dir/config.toml" ] && {
+        cat > "$dir/config.toml" << TOML
 [app]
 address = "0.0.0.0:${AIOPS_PORT_LISTMONK}"
 admin_username = "admin"
@@ -1033,95 +1232,47 @@ password = "listmonk_password"
 database = "listmonk"
 ssl_mode = "disable"
 TOML
-        "$lm_bin" --config "$lm_dir/config.toml" --install --yes 2>/dev/null || true
-        _log_add "Listmonk database installed"
-    fi
+        "$bin" --config "$dir/config.toml" --install --yes 2>/dev/null || true
+    }
 
     cat > "$SCRIPTS_DIR/run-listmonk.sh" << LSCRIPT
 #!/bin/bash
 source "${AIOPS_CONF}"
-exec "${lm_bin}" --config "${lm_dir}/config.toml"
+exec "${bin}" --config "${dir}/config.toml"
 LSCRIPT
     chmod +x "$SCRIPTS_DIR/run-listmonk.sh"
-    pm2 start "$SCRIPTS_DIR/run-listmonk.sh" --name listmonk 2>/dev/null || true
-    pm2 save
-
-    _log_add "Listmonk installed"
-    local local_ip; local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
-    echo "  → http://${local_ip}:${AIOPS_PORT_LISTMONK}  (admin / change_me_now)"
-    echo -e "  ${RED}⚠  Change password on first login${NC}"
-}
-
-addon_openfang() {
-    _section_add "Installing OpenFang"
-    _warn_add "Checking OpenFang availability..."
-
-    if curl -fsSL --max-time 10 https://openfang.sh/install -o /tmp/openfang-install.sh 2>/dev/null; then
-        bash /tmp/openfang-install.sh
-        rm -f /tmp/openfang-install.sh
-        # Export in-session immediately — installer writes to ~/.bashrc
-        # but the running script won't source it
-        export PATH="$HOME/.openfang/bin:$PATH"
-        if command -v openfang &>/dev/null; then
-            _log_add "OpenFang $(openfang --version 2>/dev/null) installed"
-            for hand in lead browser researcher twitter; do
-                openfang hand activate "$hand" 2>/dev/null \
-                    && _log_add "Hand activated: $hand" \
-                    || _warn_add "Hand activation failed: $hand"
-            done
-            echo "  Config: ~/.openfang/config.yaml"
-            echo "  Init:   openfang init"
-        else
-            _warn_add "OpenFang binary not found after install — check ~/.openfang/bin"
-        fi
-    else
-        if [ ! -d "$VENVS_DIR/openfang" ]; then
-            python3 -m venv "$VENVS_DIR/openfang"
-            "$VENVS_DIR/openfang/bin/pip" install --upgrade pip -q
-            "$VENVS_DIR/openfang/bin/pip" install openfang -q 2>/dev/null \
-                && { cat > "$SCRIPTS_DIR/run-openfang.sh" << OFSCRIPT
-#!/bin/bash
-source "${AIOPS_CONF}"
-exec "\${AIOPS_VENVS_DIR}/openfang/bin/openfang" "\$@"
-OFSCRIPT
-                chmod +x "$SCRIPTS_DIR/run-openfang.sh"
-                _log_add "OpenFang installed via pip"; } \
-                || _warn_add "OpenFang not yet available — check https://github.com/openfang"
-        fi
-    fi
+    _start_and_verify "listmonk" "$SCRIPTS_DIR/run-listmonk.sh" "$dir" "${AIOPS_PORT_LISTMONK}" "Listmonk"
+    _warn_add "Change Listmonk password after first login (admin / change_me_now)"
 }
 
 addon_mautic() {
-    _section_add "Installing Mautic"
+    _section_add "Mautic Marketing Automation"
     conf_load
 
+    # PHP
     command -v php &>/dev/null || {
-        _info_add "Installing PHP 8.1..."
         sudo apt-get install -y \
-            php8.1 php8.1-cli php8.1-fpm \
-            php8.1-mysql php8.1-xml php8.1-mbstring \
-            php8.1-curl php8.1-zip php8.1-gd \
-            php8.1-intl php8.1-bcmath composer -q
-        _log_add "PHP 8.1 installed"
+            php8.1 php8.1-cli php8.1-fpm php8.1-mysql php8.1-xml \
+            php8.1-mbstring php8.1-curl php8.1-zip php8.1-gd \
+            php8.1-intl php8.1-bcmath composer -q 2>/dev/null || true
     }
 
+    # MariaDB
     command -v mysql &>/dev/null || {
-        sudo apt-get install -y mariadb-server -q
-        sudo systemctl enable mariadb && sudo systemctl start mariadb
+        sudo apt-get install -y mariadb-server -q 2>/dev/null
+        sudo systemctl enable mariadb 2>/dev/null || true
+        sudo systemctl start mariadb 2>/dev/null || true
         sudo mysql -e "CREATE DATABASE IF NOT EXISTS mautic CHARACTER SET utf8mb4;" 2>/dev/null || true
         sudo mysql -e "CREATE USER IF NOT EXISTS 'mautic'@'localhost' IDENTIFIED BY 'mautic_password';" 2>/dev/null || true
-        sudo mysql -e "GRANT ALL PRIVILEGES ON mautic.* TO 'mautic'@'localhost';" 2>/dev/null || true
+        sudo mysql -e "GRANT ALL ON mautic.* TO 'mautic'@'localhost';" 2>/dev/null || true
         sudo mysql -e "FLUSH PRIVILEGES;" 2>/dev/null || true
-        _log_add "MariaDB configured"
     }
 
-    local mautic_dir="$HOME/mautic"
-    if [ ! -d "$mautic_dir" ]; then
-        _info_add "Installing Mautic via Composer..."
-        composer create-project mautic/recommended-project:^5 "$mautic_dir" \
-            --no-interaction -q 2>/dev/null \
-            || composer create-project mautic/recommended-project "$mautic_dir" --no-interaction
-        cat > "$mautic_dir/.env.local" << MENV
+    local dir="$HOME/mautic"
+    [ ! -d "$dir" ] && {
+        composer create-project mautic/recommended-project:^5 "$dir" --no-interaction -q 2>/dev/null \
+            || composer create-project mautic/recommended-project "$dir" --no-interaction 2>/dev/null || true
+        cat > "$dir/.env.local" << MENV
 APP_URL=http://localhost:${AIOPS_PORT_MAUTIC}
 APP_ENV=prod
 DB_HOST=localhost
@@ -1130,68 +1281,121 @@ DB_NAME=mautic
 DB_USER=mautic
 DB_PASSWD=mautic_password
 MENV
-        _log_add "Mautic installed"
-    else
-        _log_add "Mautic already installed"
-    fi
+    }
 
     cat > "$SCRIPTS_DIR/run-mautic.sh" << MSCRIPT
 #!/bin/bash
 source "${AIOPS_CONF}"
-cd "${mautic_dir}"
+cd "${dir}"
 export APP_ENV=prod
 exec php -S 0.0.0.0:\${AIOPS_PORT_MAUTIC} public/index.php
 MSCRIPT
     chmod +x "$SCRIPTS_DIR/run-mautic.sh"
-    pm2 start "$SCRIPTS_DIR/run-mautic.sh" --name mautic 2>/dev/null || true
-    pm2 save
+    _start_and_verify "mautic" "$SCRIPTS_DIR/run-mautic.sh" "$dir" "${AIOPS_PORT_MAUTIC}" "Mautic"
+}
 
-    _log_add "Mautic running"
-    local local_ip; local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
-    echo "  → http://${local_ip}:${AIOPS_PORT_MAUTIC}"
+addon_netdata() {
+    _section_add "Netdata System Monitor"
+    conf_load
+
+    command -v netdata &>/dev/null || {
+        curl -fsSL https://my-netdata.io/kickstart.sh 2>/dev/null \
+            | sh -s -- --non-interactive 2>/dev/null || true
+    }
+
+    local nd_conf; nd_conf=$(find /etc/netdata -name "netdata.conf" 2>/dev/null | head -1)
+    [ -n "$nd_conf" ] && {
+        sudo sed -i 's/# *bind to.*/bind to = 0.0.0.0/' "$nd_conf" 2>/dev/null || true
+        sudo sed -i 's/^bind to = localhost/bind to = 0.0.0.0/' "$nd_conf" 2>/dev/null || true
+        sudo systemctl restart netdata 2>/dev/null || true
+    }
+    _log_add "Netdata running on port ${AIOPS_PORT_NETDATA}"
+}
+
+addon_langfuse() {
+    _section_add "Langfuse LLM Observability"
+    conf_load
+    _ensure_shared_deps
+
+    local dir="$HOME/langfuse"
+    [ ! -d "$dir" ] && {
+        git clone https://github.com/langfuse/langfuse.git "$dir" 2>/dev/null
+    }
+
+    sudo -u postgres psql -lqt 2>/dev/null | grep -q langfuse || {
+        sudo -u postgres psql -c "CREATE USER langfuse WITH PASSWORD 'langfuse_password';" 2>/dev/null || true
+        sudo -u postgres psql -c "CREATE DATABASE langfuse OWNER langfuse;" 2>/dev/null || true
+    }
+
+    cd "$dir"
+    [ ! -f ".env" ] && {
+        local secret; secret=$(openssl rand -base64 32)
+        local salt; salt=$(openssl rand -base64 32)
+        cat > .env << LFENV
+NODE_ENV=production
+DATABASE_URL=postgresql://langfuse:langfuse_password@localhost:5432/langfuse
+NEXTAUTH_URL=http://localhost:${AIOPS_PORT_LANGFUSE}
+NEXTAUTH_SECRET=${secret}
+SALT=${salt}
+PORT=${AIOPS_PORT_LANGFUSE}
+LFENV
+    }
+
+    _info "Installing Langfuse (pnpm)..."
+    pnpm install 2>/dev/null || true
+    pnpm build 2>/dev/null || true
+
+    cat > "$SCRIPTS_DIR/run-langfuse.sh" << LFSCRIPT
+#!/bin/bash
+source "${AIOPS_CONF}"
+export NVM_DIR="\$HOME/.nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
+cd "${dir}"
+exec pnpm start
+LFSCRIPT
+    chmod +x "$SCRIPTS_DIR/run-langfuse.sh"
+    _start_and_verify "langfuse" "$SCRIPTS_DIR/run-langfuse.sh" "$dir" "${AIOPS_PORT_LANGFUSE}" "Langfuse"
+    cd "$HOME"
 }
 
 addon_chatwoot() {
-    _section_add "Installing Chatwoot"
+    _section_add "Chatwoot Unified Inbox"
     conf_load
+    _ensure_shared_deps
 
-    command -v ruby &>/dev/null \
-        && _log_add "Ruby: $(ruby -v)" \
-        || { sudo apt-get install -y ruby ruby-dev -q && _log_add "Ruby: $(ruby -v)"; }
-
-    # User gem install — system Ruby dir is root-owned on Ubuntu 22/24
+    # Ruby — user gem space to avoid permission issues
+    command -v ruby &>/dev/null || {
+        sudo apt-get install -y ruby ruby-dev -q 2>/dev/null
+    }
     local ruby_minor; ruby_minor=$(ruby -e 'puts RUBY_VERSION.split(".")[0..1].join(".")' 2>/dev/null || echo "3.2")
     local gem_bin="$HOME/.gem/ruby/${ruby_minor}.0/bin"
+    mkdir -p "$gem_bin"
     command -v bundle &>/dev/null || [ -f "$gem_bin/bundle" ] \
-        || gem install bundler --user-install
+        || gem install bundler --user-install 2>/dev/null || true
     export PATH="$gem_bin:$PATH"
 
-    local cw_dir="$HOME/chatwoot"
-    [ ! -d "$cw_dir" ] \
-        && git clone https://github.com/chatwoot/chatwoot.git "$cw_dir" \
-        && _log_add "Chatwoot cloned" \
-        || _log_add "Chatwoot already cloned"
+    local dir="$HOME/chatwoot"
+    [ ! -d "$dir" ] && git clone https://github.com/chatwoot/chatwoot.git "$dir" 2>/dev/null
 
     sudo -u postgres psql -lqt 2>/dev/null | grep -q chatwoot || {
         sudo -u postgres psql -c "CREATE USER chatwoot WITH PASSWORD 'chatwoot_password';" 2>/dev/null || true
         sudo -u postgres psql -c "CREATE DATABASE chatwoot OWNER chatwoot;" 2>/dev/null || true
     }
 
-    cd "$cw_dir"
-    if [ ! -f ".env" ]; then
-        cp .env.example .env
+    cd "$dir"
+    [ ! -f ".env" ] && {
+        cp .env.example .env 2>/dev/null || true
         local secret; secret=$(openssl rand -hex 64)
-        sed -i "s|SECRET_KEY_BASE=.*|SECRET_KEY_BASE=${secret}|" .env
-        sed -i "s|DATABASE_URL=.*|DATABASE_URL=postgresql://chatwoot:chatwoot_password@localhost:5432/chatwoot|" .env
-        sed -i "s|REDIS_URL=.*|REDIS_URL=redis://localhost:6379|" .env
-        sed -i "s|PORT=3000|PORT=${AIOPS_PORT_CHATWOOT}|" .env
-        _log_add ".env configured"
-    fi
+        sed -i "s|SECRET_KEY_BASE=.*|SECRET_KEY_BASE=${secret}|" .env 2>/dev/null || true
+        sed -i "s|DATABASE_URL=.*|DATABASE_URL=postgresql://chatwoot:chatwoot_password@localhost:5432/chatwoot|" .env 2>/dev/null || true
+        sed -i "s|REDIS_URL=.*|REDIS_URL=redis://localhost:6379|" .env 2>/dev/null || true
+        sed -i "s|PORT=3000|PORT=${AIOPS_PORT_CHATWOOT}|" .env 2>/dev/null || true
+    }
 
-    _info_add "Installing Chatwoot gems..."
-    bundle install -q 2>/dev/null || (gem install bundler --user-install && bundle install -q)
-    RAILS_ENV=production bundle exec rails db:chatwoot_prepare 2>/dev/null \
-        || RAILS_ENV=production bundle exec rails db:migrate 2>/dev/null || true
+    _info "Installing Chatwoot gems (this takes a while)..."
+    bundle install -q 2>/dev/null || true
+    RAILS_ENV=production bundle exec rails db:chatwoot_prepare 2>/dev/null || \
+        RAILS_ENV=production bundle exec rails db:migrate 2>/dev/null || true
 
     local bundle_bin; bundle_bin=$(command -v bundle 2>/dev/null || echo "$gem_bin/bundle")
 
@@ -1199,7 +1403,7 @@ addon_chatwoot() {
 #!/bin/bash
 source "${AIOPS_CONF}"
 export PATH="${gem_bin}:\$PATH"
-cd "${cw_dir}"
+cd "${dir}"
 export RAILS_ENV=production
 exec ${bundle_bin} exec rails server -b 0.0.0.0 -p \${AIOPS_PORT_CHATWOOT}
 CWSCRIPT
@@ -1208,40 +1412,34 @@ CWSCRIPT
 #!/bin/bash
 source "${AIOPS_CONF}"
 export PATH="${gem_bin}:\$PATH"
-cd "${cw_dir}"
+cd "${dir}"
 export RAILS_ENV=production
 exec ${bundle_bin} exec sidekiq
 CWWSCRIPT
 
     chmod +x "$SCRIPTS_DIR/run-chatwoot.sh" "$SCRIPTS_DIR/run-chatwoot-worker.sh"
-    pm2 start "$SCRIPTS_DIR/run-chatwoot.sh"        --name chatwoot
-    pm2 start "$SCRIPTS_DIR/run-chatwoot-worker.sh" --name chatwoot-worker
-    pm2 save
+    nvm_load
+    pm2 start "$SCRIPTS_DIR/run-chatwoot-worker.sh" --name chatwoot-worker 2>/dev/null || true
+    _start_and_verify "chatwoot" "$SCRIPTS_DIR/run-chatwoot.sh" "$dir" "${AIOPS_PORT_CHATWOOT}" "Chatwoot"
     cd "$HOME"
-
-    _log_add "Chatwoot installed"
-    local local_ip; local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
-    echo "  → http://${local_ip}:${AIOPS_PORT_CHATWOOT}"
 }
 
 addon_calcom() {
-    _section_add "Installing Cal.com"
+    _section_add "Cal.com Booking"
     conf_load
     nvm_load
+    _ensure_shared_deps
 
-    local cal_dir="$HOME/calcom"
-    [ ! -d "$cal_dir" ] \
-        && git clone https://github.com/calcom/cal.com.git "$cal_dir" \
-        && _log_add "Cal.com cloned" \
-        || _log_add "Cal.com already cloned"
+    local dir="$HOME/calcom"
+    [ ! -d "$dir" ] && git clone https://github.com/calcom/cal.com.git "$dir" 2>/dev/null
 
     sudo -u postgres psql -lqt 2>/dev/null | grep -q calcom || {
         sudo -u postgres psql -c "CREATE USER calcom WITH PASSWORD 'calcom_password';" 2>/dev/null || true
         sudo -u postgres psql -c "CREATE DATABASE calcom OWNER calcom;" 2>/dev/null || true
     }
 
-    cd "$cal_dir"
-    if [ ! -f ".env" ]; then
+    cd "$dir"
+    [ ! -f ".env" ] && {
         cp .env.example .env 2>/dev/null || touch .env
         local secret; secret=$(openssl rand -base64 32)
         cat >> .env << CAENV
@@ -1251,11 +1449,10 @@ NEXTAUTH_URL=http://localhost:${AIOPS_PORT_CALCOM}
 NEXT_PUBLIC_APP_URL=http://localhost:${AIOPS_PORT_CALCOM}
 PORT=${AIOPS_PORT_CALCOM}
 CAENV
-        _log_add ".env configured"
-    fi
+    }
 
-    _info_add "Installing Cal.com via pnpm (monorepo — npm will not work)..."
-    pnpm install
+    _info "Installing Cal.com (pnpm)..."
+    pnpm install 2>/dev/null || true
     pnpm prisma generate 2>/dev/null || true
     pnpm prisma db push 2>/dev/null || true
 
@@ -1264,148 +1461,111 @@ CAENV
 source "${AIOPS_CONF}"
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
-cd "${cal_dir}"
+cd "${dir}"
 exec pnpm next start -p \${AIOPS_PORT_CALCOM}
 CASCRIPT
     chmod +x "$SCRIPTS_DIR/run-calcom.sh"
-    pm2 start "$SCRIPTS_DIR/run-calcom.sh" --name calcom 2>/dev/null || true
-    pm2 save
+    _start_and_verify "calcom" "$SCRIPTS_DIR/run-calcom.sh" "$dir" "${AIOPS_PORT_CALCOM}" "Cal.com"
     cd "$HOME"
-
-    _log_add "Cal.com installed"
-    local local_ip; local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
-    echo "  → http://${local_ip}:${AIOPS_PORT_CALCOM}"
-}
-
-addon_monitors() {
-    _section_add "Installing System Monitors"
-    sudo apt-get update -qq
-    command -v htop  &>/dev/null && _log_add "htop already installed"  || { sudo apt-get install -y htop  -q; _log_add "htop installed"; }
-    command -v nvtop &>/dev/null && _log_add "nvtop already installed" || { sudo apt-get install -y nvtop -q; _log_add "nvtop installed"; }
-    echo "  htop   → CPU, RAM, processes"
-    echo "  nvtop  → GPU VRAM, temperature"
-}
-
-addon_netdata() {
-    _section_add "Installing Netdata"
-    conf_load
-
-    command -v netdata &>/dev/null \
-        || { curl -fsSL https://my-netdata.io/kickstart.sh | sh -s -- --non-interactive 2>/dev/null || true; _log_add "Netdata installed"; } \
-        && _log_add "Netdata already installed"
-
-    local nd_conf; nd_conf=$(find /etc/netdata -name "netdata.conf" 2>/dev/null | head -1)
-    if [ -n "$nd_conf" ]; then
-        sudo sed -i 's/# *bind to.*/bind to = 0.0.0.0/' "$nd_conf" 2>/dev/null || true
-        sudo sed -i 's/bind to = localhost/bind to = 0.0.0.0/' "$nd_conf" 2>/dev/null || true
-        sudo systemctl restart netdata 2>/dev/null || true
-    fi
-
-    _log_add "Netdata configured"
-    local local_ip; local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
-    echo "  → http://${local_ip}:${AIOPS_PORT_NETDATA}"
-    echo "  → http://${AIOPS_DOMAIN}/monitor"
 }
 
 # ── Addons menu ───────────────────────────────────────────────
-show_addons_menu() {
-    conf_load
-    echo ""
-    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║         AIOPS ADDONS — INSTALL MENU  v5.3.0             ║${NC}"
-    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo "║  [d]  Shared deps     PostgreSQL · Redis · Firecrawl     ║"
-    echo "║  [1]  Twenty CRM      Lead + deal management             ║"
-    echo "║  [2]  Listmonk        Email campaigns (binary)           ║"
-    echo "║  [3]  OpenFang        AI agent Hands                     ║"
-    echo "║  [4]  Mautic          Full marketing automation (PHP)    ║"
-    echo "║  [5]  Chatwoot        Unified inbox                      ║"
-    echo "║  [6]  Cal.com         Booking and scheduling             ║"
-    echo "║  [7]  Monitors        htop + nvtop                       ║"
-    echo "║  [8]  Netdata         Full system dashboard              ║"
-    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo "║  [a]  Core GTM        d + 1 + 2 + 3                     ║"
-    echo "║  [b]  Full GTM        d + 1 + 2 + 3 + 4 + 5 + 6         ║"
-    echo "║  [m]  All monitors    7 + 8                              ║"
-    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo "║  [s]  PM2 status                                         ║"
-    echo -e "${BOLD}║  [exit]  Done                                            ║${NC}"
-    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-}
-
-run_addon() {
-    case "$1" in
-        d|D) addon_dependencies ;;
-        1)   addon_twenty_crm ;;
-        2)   addon_listmonk ;;
-        3)   addon_openfang ;;
-        4)   addon_mautic ;;
-        5)   addon_chatwoot ;;
-        6)   addon_calcom ;;
-        7)   addon_monitors ;;
-        8)   addon_netdata ;;
-        a|A) addon_dependencies; addon_twenty_crm; addon_listmonk; addon_openfang ;;
-        b|B) addon_dependencies; addon_twenty_crm; addon_listmonk; addon_openfang; addon_mautic; addon_chatwoot; addon_calcom ;;
-        m|M) addon_monitors; addon_netdata ;;
-        s|S) nvm_load; pm2 status ;;
-        "exit"|"EXIT"|"q"|"Q") return 1 ;;
-        *) echo -e "${YELLOW}[!] Unknown: $1${NC}" ;;
-    esac
-    return 0
-}
-
-addons_loop() {
-    banner_addons
-    echo -e "${CYAN}Core install complete. Install optional tools below.${NC}"
-    echo -e "${YELLOW}Type 'exit' to finish. Space-separate multiple choices: d 1 2${NC}"
-    echo ""
-
+run_addons_menu() {
     while true; do
-        show_addons_menu
-        read -rp "$(echo -e "${YELLOW}Choice: ${NC}")" raw_input
-        local choice; choice=$(echo "$raw_input" | xargs 2>/dev/null || echo "$raw_input")
+        echo ""
+        echo -e "${BOLD}${CYAN}============================================${NC}"
+        echo -e "${BOLD}  ADDONS MENU${NC}"
+        echo -e "${BOLD}${CYAN}============================================${NC}"
+        echo "  [1]  Twenty CRM      — Lead and deal management"
+        echo "  [2]  Listmonk        — Email campaigns"
+        echo "  [3]  Mautic          — Full marketing automation"
+        echo "  [4]  Netdata         — System monitoring dashboard"
+        echo "  [5]  Langfuse        — LLM observability"
+        echo "  [6]  Chatwoot        — Unified inbox"
+        echo "  [7]  Cal.com         — Booking and scheduling"
+        echo ""
+        echo "  [a]  Install all addons"
+        echo "  [s]  Show PM2 status"
+        echo "  [exit] Finish"
+        echo ""
+        read -rp "$(echo -e "${YELLOW}  Choice (or space-separate multiple e.g. '1 2 3'): ${NC}")" choice
 
-        [[ "$choice" =~ ^(exit|EXIT|q|Q)$ ]] && { echo -e "${BOLD}${GREEN}Done.${NC}"; break; }
+        [[ "$choice" =~ ^(exit|EXIT|q|Q)$ ]] && break
 
-        if [[ "$choice" == *" "* ]]; then
-            for item in $choice; do
-                [[ "$item" =~ ^(exit|EXIT|q|Q)$ ]] && return
-                run_addon "$item" || return
-            done
-        else
-            run_addon "$choice" || break
-        fi
+        [ "$choice" = "a" ] && {
+            addon_twenty_crm; addon_listmonk; addon_mautic
+            addon_netdata; addon_langfuse; addon_chatwoot; addon_calcom
+            break
+        }
 
-        echo -e "\n${CYAN}Done. Back to menu...${NC}"
-        sleep 1
+        [ "$choice" = "s" ] && { nvm_load; pm2 status; continue; }
+
+        for item in $choice; do
+            case "$item" in
+                1) addon_twenty_crm ;;
+                2) addon_listmonk ;;
+                3) addon_mautic ;;
+                4) addon_netdata ;;
+                5) addon_langfuse ;;
+                6) addon_chatwoot ;;
+                7) addon_calcom ;;
+                *) echo "  Unknown option: $item" ;;
+            esac
+        done
     done
 }
 
-# ── Final summary ─────────────────────────────────────────────
-print_final_summary() {
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+print_summary() {
     conf_load
-    local local_ip; local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || echo "YOUR_IP")
+    nvm_load
 
     echo ""
     echo -e "${BOLD}${GREEN}"
-    echo "  ╔══════════════════════════════════════════════════════════╗"
-    echo "  ║   AIOPS v5.3.0 — SETUP COMPLETE                         ║"
-    echo "  ╠══════════════════════════════════════════════════════════╣"
-    printf "  ║   OpenWebUI     http://%-34s║\n" "${local_ip}:${AIOPS_PORT_OPENWEBUI}"
-    printf "  ║   n8n           http://%-34s║\n" "${AIOPS_DOMAIN}/n8n"
-    printf "  ║   Qdrant        http://%-34s║\n" "${local_ip}:${AIOPS_PORT_QDRANT}"
-    printf "  ║   CrewAI Studio http://%-34s║\n" "${AIOPS_DOMAIN}/agents"
-    printf "  ║   Ollama        http://%-34s║\n" "${local_ip}:${AIOPS_PORT_OLLAMA}"
-    echo "  ╠══════════════════════════════════════════════════════════╣"
-    echo "  ║   ai-status   ai-logs   ai-restart   ai-urls   ai-config ║"
-    echo "  ╚══════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    echo -e "  ${BOLD}Config:${NC} ${AIOPS_CONF}"
-    echo -e "  ${BOLD}Reload:${NC} source ~/.bashrc"
+    echo "  ============================================"
+    echo "  AIOPS v6.0.0 — READY"
+    echo "  ============================================"
     echo ""
-    echo -e "${BOLD}${CYAN}Quantocos AI Labs${NC}"
-    echo -e "${CYAN}\"Build with intelligence. Operate with precision.\"${NC}"
+    echo "  Open these URLs in your browser:"
+    echo ""
+    printf "  %-20s http://%s\n"  "OpenWebUI (Chat)"  "${AIOPS_DOMAIN}"
+    printf "  %-20s http://%s\n"  "n8n (Automation)"  "${AIOPS_DOMAIN}/n8n"
+    printf "  %-20s http://%s\n"  "CrewAI Studio"     "${AIOPS_DOMAIN}/agents"
+    printf "  %-20s http://%s\n"  "Qdrant UI"         "localhost:${AIOPS_PORT_QDRANT}"
+    printf "  %-20s http://%s\n"  "Ollama API"        "localhost:${AIOPS_PORT_OLLAMA}"
+
+    # Show addon URLs if installed
+    pm2 list 2>/dev/null | grep -q twenty    && printf "  %-20s http://%s\n" "Twenty CRM"    "localhost:${AIOPS_PORT_TWENTY}"
+    pm2 list 2>/dev/null | grep -q listmonk  && printf "  %-20s http://%s\n" "Listmonk"      "localhost:${AIOPS_PORT_LISTMONK}"
+    pm2 list 2>/dev/null | grep -q mautic    && printf "  %-20s http://%s\n" "Mautic"        "localhost:${AIOPS_PORT_MAUTIC}"
+    pm2 list 2>/dev/null | grep -q langfuse  && printf "  %-20s http://%s\n" "Langfuse"      "localhost:${AIOPS_PORT_LANGFUSE}"
+    pm2 list 2>/dev/null | grep -q chatwoot  && printf "  %-20s http://%s\n" "Chatwoot"      "localhost:${AIOPS_PORT_CHATWOOT}"
+    pm2 list 2>/dev/null | grep -q calcom    && printf "  %-20s http://%s\n" "Cal.com"       "localhost:${AIOPS_PORT_CALCOM}"
+    command -v netdata &>/dev/null           && printf "  %-20s http://%s\n" "Netdata"       "localhost:${AIOPS_PORT_NETDATA}"
+
+    echo ""
+    echo "  ============================================"
+    echo -e "${NC}"
+
+    # Report any failures
+    if [ "${#INSTALL_FAILURES[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}  The following items had issues (everything else is working):${NC}"
+        for f in "${INSTALL_FAILURES[@]}"; do
+            echo -e "  ${YELLOW}  - $f${NC}"
+        done
+        echo -e "${YELLOW}  See $LOG_FILE for details.${NC}"
+        echo ""
+    fi
+
+    echo -e "  ${CYAN}To pull an AI model:   ollama pull qwen3:4b${NC}"
+    echo -e "  ${CYAN}To check services:     ai-status${NC}"
+    echo -e "  ${CYAN}To see URLs again:     ai-urls${NC}"
+    echo ""
+    echo -e "  ${BOLD}Reload your terminal:  source ~/.bashrc${NC}"
+    echo ""
+    echo -e "${BOLD}${CYAN}  Quantocos AI Labs — Build with intelligence. Operate with precision.${NC}"
     echo ""
 }
 
@@ -1413,43 +1573,39 @@ print_final_summary() {
 # MAIN
 # ============================================================
 main() {
-    clear
-    banner_core
+    show_banner
+    detect_os
 
-    echo -e "${BOLD}AIOPS v5.3.0 — Full Stack Installer${NC}"
-    echo ""
-    echo "  PART 1 — Core (automatic after first confirm)"
-    echo "  PART 2 — Addons (interactive menu)"
-    echo ""
-
-    confirm "Proceed with installation?" || { echo "Cancelled."; exit 0; }
-
-    preinit
+    select_mode
+    setup_domain
+    setup_streamlit_email
+    write_config
     preflight
-    setup_config       # writes ~/aiops-server/aiops.conf — single source of truth
-    setup_dirs
-    install_system_deps
-    setup_wsl_system
-    setup_mdns
-    install_caddy
-    install_node
-    install_pnpm
-    install_pm2
-    install_ollama
-    install_n8n
-    install_openwebui
-    install_qdrant
-    setup_venvs
-    install_crewai_studio
-    create_launchers   # all launchers source aiops.conf at runtime
-    setup_aliases
-    setup_pm2_services
-    create_sample_crew
-    print_core_summary
 
-    addons_loop
+    mkdir -p "$SCRIPTS_DIR" "$AGENTS_DIR" "$VENVS_DIR"
 
-    print_final_summary
+    if [[ "$INSTALL_MODE" == "core" || "$INSTALL_MODE" == "full" ]]; then
+        install_homebrew        # Mac only, no-op on Linux
+        install_system_deps
+        install_node
+        install_ollama
+        install_qdrant
+        install_openwebui
+        install_n8n
+        install_crewai
+        install_playwright
+        install_optional_tools
+        setup_mdns
+        install_caddy           # Last — after all services verified
+        setup_pm2_startup
+        setup_aliases
+    fi
+
+    if [[ "$INSTALL_MODE" == "addons" || "$INSTALL_MODE" == "full" ]]; then
+        run_addons_menu
+    fi
+
+    print_summary
 }
 
 main "$@"
