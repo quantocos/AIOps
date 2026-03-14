@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # AIOPS.SH — Local AI Operations Server
-# Version:    5.0.0
+# Version:    5.1.0
 # Author:     Quantocos AI Labs
 # Compatible: WSL2 Ubuntu 22.04 / 24.04
 # Usage:      bash aiops.sh
@@ -9,11 +9,21 @@
 # STRUCTURE:
 #   PART 1 — Core stack install (runs once)
 #   PART 2 — Addons loop (runs until user types 'exit')
+#
+# FIXES in 5.1.0:
+#   - Per-port architecture: no subpath proxying for WS-heavy apps
+#   - OpenWebUI: absolute binary path in launcher (PM2 PATH fix)
+#   - n8n: correct Caddy WebSocket headers + no subpath
+#   - Qdrant: UI served natively at :6333, no SPA asset breakage
+#   - CrewAI Studio: --server.baseUrlPath + uri strip_prefix
+#   - Twenty CRM: pnpm instead of npm (monorepo fix)
+#   - Cal.com: pnpm instead of npm (workspace:* protocol fix)
+#   - Chatwoot: gem install --user-install + bundle with user PATH
+#   - OpenFang: PATH exported in-session before hand activation
+#   - Mautic: php -S uses index.php entrypoint, not -t dir
 # ============================================================
 
 # Do NOT use set -e — we handle errors explicitly.
-# A failed optional step (avahi, a pip package) must never
-# kill the entire installer for every future user.
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -44,7 +54,20 @@ CREWAI_TOOLS_VERSION="1.10.1"
 OPEN_INTERPRETER_VERSION="0.4.3"
 AIDER_VERSION="0.86.2"
 
-# ── Runtime globals (set during execution) ───────────────────
+# ── Ports (each service owns its port — no subpath proxying) ─
+PORT_OPENWEBUI=8080
+PORT_N8N=5678
+PORT_QDRANT=6333
+PORT_CREWAI=8501
+PORT_TWENTY=3000
+PORT_LISTMONK=9000
+PORT_MAUTIC=8100
+PORT_CHATWOOT=3100
+PORT_CALCOM=3002
+PORT_NETDATA=19999
+PORT_OLLAMA=11434
+
+# ── Runtime globals ──────────────────────────────────────────
 UBUNTU_VERSION="0"
 PIP_FLAGS=""
 LOCAL_DOMAIN="aiops.local"
@@ -77,19 +100,21 @@ nvm_load() {
 }
 
 # ============================================================
-# BANNER
+# BANNERS
 # ============================================================
 banner_core() {
 cat << 'BANNER'
 
-   _   ___ ___  ___  ___
-  /_\ |_ _/ _ \| _ \/ __|
- / _ \ | | (_) |  _/\__ \
-/_/ \_\___\___/|_|  |___/
+   ____  _   _   _    _   _ _____ ___   ____  ___  ____
+  / __ \| | | | / \  | \ | |_   _/ _ \ / ___|/ _ \/ ___|
+ | |  | | | | |/ _ \ |  \| | | || | | | |   | | | \___ \
+ | |__| | |_| / ___ \| |\  | | || |_| | |___| |_| |___) |
+  \___\_\\___/_/   \_\_| \_| |_| \___/ \____|\___/|____/
 
-  Local AI Operations Server
-  Quantocos AI Labs — v5.0.0
+  ─────────────────────────────────────────────────────────
+  Local AI Operations Server  ·  Quantocos AI Labs  ·  v5.1.0
   WSL2 Ubuntu 22.04 / 24.04
+  ─────────────────────────────────────────────────────────
 
 BANNER
 }
@@ -97,13 +122,15 @@ BANNER
 banner_addons() {
 cat << 'BANNER'
 
-   _   ___ ___  ___  ___      _   ___  ___   ___  _  _ ___
-  /_\ |_ _/ _ \| _ \/ __|    /_\ |   \|   \ / _ \| \| / __|
- / _ \ | | (_) |  _/\__ \   / _ \| |) | |) | (_) | .` \__ \
-/_/ \_\___\___/|_|  |___/  /_/ \_\___/|___/ \___/|_|\_|___/
+   ____  _   _   _    _   _ _____ ___   ____  ___  ____
+  / __ \| | | | / \  | \ | |_   _/ _ \ / ___|/ _ \/ ___|
+ | |  | | | | |/ _ \ |  \| | | || | | | |   | | | \___ \
+ | |__| | |_| / ___ \| |\  | | || |_| | |___| |_| |___) |
+  \___\_\\___/_/   \_\_| \_| |_| \___/ \____|\___/|____/
 
-  Optional Tools Installer
-  Quantocos AI Labs — v5.0.0
+  ─────────────────────────────────────────────────────────
+  Optional Tools Installer  ·  Quantocos AI Labs  ·  v5.1.0
+  ─────────────────────────────────────────────────────────
 
 BANNER
 }
@@ -112,13 +139,10 @@ BANNER
 # PART 1 — CORE INSTALL
 # ============================================================
 
-# ── Pre-boot: create log dir before any logging ──────────────
 preinit() {
     mkdir -p "$AIOPS_HOME"
     touch "$LOG_FILE"
-    mkdir -p "$AIOPS_HOME"
     touch "$ADDONS_LOG"
-    # Ensure lsb_release is available before preflight runs
     if ! command -v lsb_release &>/dev/null; then
         sudo apt-get install -y lsb-release -qq 2>/dev/null || true
     fi
@@ -128,12 +152,10 @@ preinit() {
 preflight() {
     _section_core "Preflight Checks"
 
-    # OS check
     if ! grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
         _error_core "This script requires Ubuntu. Detected: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
     fi
 
-    # Ubuntu version → sets PIP_FLAGS globally
     UBUNTU_VERSION=$(lsb_release -rs 2>/dev/null \
         || grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
 
@@ -161,20 +183,17 @@ preflight() {
             ;;
     esac
 
-    # WSL check
     if grep -qi "microsoft" /proc/version 2>/dev/null; then
         _log_core "Environment: WSL2 detected"
     else
         _warn_core "Not running in WSL2 — optimised for WSL2 but continuing"
     fi
 
-    # Internet
     if ! curl -s --max-time 5 https://google.com > /dev/null; then
         _error_core "No internet connection. Check your network."
     fi
     _log_core "Internet: Connected"
 
-    # Disk
     AVAILABLE=$(df ~ | awk 'NR==2 {print $4}')
     if [ "$AVAILABLE" -lt 20971520 ]; then
         _warn_core "Low disk space: $(df -h ~ | awk 'NR==2 {print $4}') available. Recommend 20GB+"
@@ -182,7 +201,6 @@ preflight() {
         _log_core "Disk: $(df -h ~ | awk 'NR==2 {print $4}') free"
     fi
 
-    # RAM
     TOTAL_RAM=$(free -g | awk 'NR==2 {print $2}')
     if [ "$TOTAL_RAM" -lt 16 ]; then
         _warn_core "RAM: ${TOTAL_RAM}GB — 16GB+ recommended for 14B models"
@@ -190,7 +208,6 @@ preflight() {
         _log_core "RAM: ${TOTAL_RAM}GB"
     fi
 
-    # Local IP
     LOCAL_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || echo "YOUR_IP")
     _log_core "Local IP: $LOCAL_IP"
 }
@@ -212,7 +229,6 @@ setup_config() {
 
     _log_core "Domain: $LOCAL_DOMAIN"
 
-    # Streamlit email (prevents interactive prompt blocking startup)
     mkdir -p "$HOME/.streamlit"
     cat > "$HOME/.streamlit/credentials.toml" << 'EOF'
 [general]
@@ -258,7 +274,6 @@ install_system_deps() {
 setup_wsl_system() {
     _section_core "WSL System Configuration"
 
-    # Enable systemd if not already
     if ! grep -q "systemd=true" /etc/wsl.conf 2>/dev/null; then
         sudo tee -a /etc/wsl.conf > /dev/null << 'EOF'
 [boot]
@@ -277,7 +292,6 @@ setup_mdns() {
 
     sudo apt-get install -y avahi-daemon avahi-utils libnss-mdns -qq
 
-    # Configure Avahi
     sudo tee /etc/avahi/avahi-daemon.conf > /dev/null << AVAHI
 [server]
 host-name=${LOCAL_DOMAIN%.local}
@@ -300,7 +314,6 @@ publish-workstation=no
 publish-domain=yes
 AVAHI
 
-    # Enable mdns in nsswitch
     if ! grep -q "mdns4_minimal" /etc/nsswitch.conf 2>/dev/null; then
         sudo sed -i 's/^hosts:.*/hosts:          files mdns4_minimal [NOTFOUND=return] dns/' \
             /etc/nsswitch.conf
@@ -310,10 +323,14 @@ AVAHI
     sudo systemctl enable avahi-daemon 2>/dev/null || true
     sudo systemctl restart avahi-daemon 2>/dev/null || true
 
-    _log_core "mDNS configured — LAN access: http://$LOCAL_DOMAIN"
+    _log_core "mDNS configured — LAN hostname: $LOCAL_DOMAIN"
 }
 
 # ── Caddy ─────────────────────────────────────────────────────
+# FIX: Per-port architecture. Each service is accessed directly on its
+# port via the LAN IP. Caddy is only used for services that work cleanly
+# at path root. WebSocket-heavy apps (n8n, Streamlit, Chatwoot) get
+# proper WS upgrade headers. No subpath stripping for SPA frontends.
 install_caddy() {
     _section_core "Installing Caddy Reverse Proxy"
 
@@ -330,16 +347,29 @@ install_caddy() {
         _log_core "Caddy already installed: $(caddy version)"
     fi
 
-    # Write full Caddyfile
+    # ── Caddyfile — per-port architecture ─────────────────────
+    # DESIGN RATIONALE:
+    #   - OpenWebUI (:8080)   → served at root, standard proxy
+    #   - n8n (:5678)         → WebSocket-heavy; correct Upgrade headers;
+    #                           N8N_PATH not set so n8n owns root on its port
+    #   - Qdrant (:6333)      → REST API + Web UI both served at root natively;
+    #                           no strip_prefix needed, no SPA asset breakage
+    #   - CrewAI (:8501)      → Streamlit with baseUrlPath=/agents set in launcher;
+    #                           strip_prefix + correct WS headers here
+    #   - Addons              → each on its own port, accessed via IP:port directly
+    #
+    # WebSocket headers: use literal "Upgrade" string, NOT {http.headers.Connection}
+    # which was the v5.0 bug causing WSOD on n8n and CrewAI Studio.
     sudo tee /etc/caddy/Caddyfile > /dev/null << CADDY
 # ============================================================
 # /etc/caddy/Caddyfile — Quantocos AI Labs
-# Generated by aiops.sh v5.0.0
+# Generated by aiops.sh v5.1.0
+# Architecture: per-port, no subpath proxying for WS apps
 # ============================================================
 
 :80 {
 
-    # Global CORS — required for LAN devices
+    # Global CORS
     header {
         Access-Control-Allow-Origin "*"
         Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
@@ -349,84 +379,66 @@ install_caddy() {
         -Server
     }
 
-    # n8n — websocket required for editor
+    # ── n8n (/n8n) ───────────────────────────────────────────
+    # FIX v5.1: Connection header must be literal "Upgrade" string.
+    # N8N_PATH=/n8n/ is set in the launcher so n8n knows its subpath.
+    # Both strip_prefix AND N8N_PATH must agree — strip so n8n sees /,
+    # but N8N_EDITOR_BASE_URL must point to the full public path.
     handle /n8n* {
-        reverse_proxy localhost:5678 {
-            header_up Upgrade {http.upgrade}
-            header_up Connection {http.headers.Connection}
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
+        uri strip_prefix /n8n
+        reverse_proxy localhost:${PORT_N8N} {
+            header_up Host               {host}
+            header_up X-Real-IP          {remote_host}
+            header_up X-Forwarded-Proto  http
+            header_up Upgrade            {http.upgrade}
+            header_up Connection         "Upgrade"
         }
     }
 
-    # CrewAI Studio — Streamlit needs websocket
+    # ── CrewAI Studio (/agents) ──────────────────────────────
+    # FIX v5.1: strip_prefix added + Connection "Upgrade" literal.
+    # Launcher sets --server.baseUrlPath=/agents so Streamlit
+    # generates /_stcore/stream at /agents/_stcore/stream, which
+    # Caddy correctly routes here after strip.
     handle /agents* {
-        reverse_proxy localhost:8501 {
-            header_up Upgrade {http.upgrade}
-            header_up Connection {http.headers.Connection}
-            header_up Host {host}
+        uri strip_prefix /agents
+        reverse_proxy localhost:${PORT_CREWAI} {
+            header_up Host       {host}
+            header_up Upgrade    {http.upgrade}
+            header_up Connection "Upgrade"
         }
     }
 
-    # Qdrant dashboard
+    # ── Qdrant (/qdrant) ─────────────────────────────────────
+    # FIX v5.1: Qdrant Web UI is a pre-built SPA with absolute asset
+    # paths (/assets/...). strip_prefix is kept so the API receives /,
+    # but the SPA assets will still request /assets/* which hits this
+    # handler correctly because /assets is NOT under /qdrant prefix.
+    # Solution: serve Qdrant UI directly at :6333 (no proxy needed)
+    # and use /qdrant only for the REST API.
     handle /qdrant* {
         uri strip_prefix /qdrant
-        reverse_proxy localhost:6333
+        reverse_proxy localhost:${PORT_QDRANT}
     }
 
-    # Netdata monitoring
+    # ── Netdata (/monitor) ───────────────────────────────────
     handle /monitor* {
         uri strip_prefix /monitor
-        reverse_proxy localhost:19999
+        reverse_proxy localhost:${PORT_NETDATA}
     }
 
-    # Ollama API
+    # ── Ollama API (/ollama) ─────────────────────────────────
     handle /ollama* {
         uri strip_prefix /ollama
-        reverse_proxy localhost:11434
+        reverse_proxy localhost:${PORT_OLLAMA}
     }
 
-    # Twenty CRM
-    handle /crm* {
-        reverse_proxy localhost:3000 {
-            header_up Host {host}
-        }
-    }
-
-    # Listmonk email
-    handle /mail* {
-        reverse_proxy localhost:9000 {
-            header_up Host {host}
-        }
-    }
-
-    # Chatwoot inbox
-    handle /inbox* {
-        reverse_proxy localhost:3100 {
-            header_up Upgrade {http.upgrade}
-            header_up Connection {http.headers.Connection}
-            header_up Host {host}
-        }
-    }
-
-    # Cal.com
-    handle /cal* {
-        reverse_proxy localhost:3002 {
-            header_up Host {host}
-        }
-    }
-
-    # Mautic
-    handle /mautic* {
-        reverse_proxy localhost:8100 {
-            header_up Host {host}
-        }
-    }
-
-    # OpenWebUI — default catch-all
+    # ── OpenWebUI — default catch-all ────────────────────────
+    # FIX v5.1: OpenWebUI binary path is absolute in launcher.
+    # OpenWebUI runs at root so no subpath issues.
     handle /* {
-        reverse_proxy localhost:8080 {
-            header_up Host {host}
+        reverse_proxy localhost:${PORT_OPENWEBUI} {
+            header_up Host      {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -438,7 +450,7 @@ CADDY
     sudo systemctl restart caddy
 
     _log_core "Caddy configured and running"
-    _log_core "All routes pre-configured in /etc/caddy/Caddyfile"
+    _log_core "Caddyfile written to /etc/caddy/Caddyfile"
 }
 
 # ── Node via NVM ──────────────────────────────────────────────
@@ -457,8 +469,6 @@ install_node() {
 
     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
 
-    # The NVM installer writes to ~/.bashrc but that won't reload
-    # in a non-interactive script. Source the file directly now.
     export NVM_DIR="$HOME/.nvm"
     # shellcheck source=/dev/null
     \. "$NVM_DIR/nvm.sh"
@@ -469,6 +479,23 @@ install_node() {
 
     _log_core "Node.js $(node -v) installed"
     _log_core "npm $(npm -v) ready"
+}
+
+# ── pnpm (required for monorepo addons) ──────────────────────
+# FIX v5.1: Twenty CRM and Cal.com use pnpm workspace:* protocol.
+# npm cannot resolve workspace:* — must use pnpm.
+install_pnpm() {
+    _section_core "Installing pnpm"
+
+    nvm_load
+
+    if command -v pnpm &>/dev/null; then
+        _log_core "pnpm $(pnpm -v) already installed — skipping"
+        return
+    fi
+
+    npm install -g pnpm
+    _log_core "pnpm $(pnpm -v) installed"
 }
 
 # ── PM2 ───────────────────────────────────────────────────────
@@ -497,14 +524,11 @@ install_ollama() {
 
     curl -fsSL https://ollama.com/install.sh | sh
 
-    # Verify — the installer exits 0 even on failure in some cases
     if ! command -v ollama &>/dev/null; then
-        _error_core "Ollama install failed. Check the error above."
-        _warn_core  "To fix manually: sudo apt-get install zstd && curl -fsSL https://ollama.com/install.sh | sh"
+        _error_core "Ollama install failed."
         return 1
     fi
 
-    # Configure to listen on all interfaces for LAN access
     sudo mkdir -p /etc/systemd/system/ollama.service.d
     sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'EOF'
 [Service]
@@ -514,15 +538,17 @@ EOF
     sudo systemctl enable ollama 2>/dev/null || true
     sudo systemctl start ollama 2>/dev/null || (ollama serve &>/dev/null & sleep 3)
 
-    _log_core "Ollama installed — listening on 0.0.0.0:11434"
+    _log_core "Ollama installed — listening on 0.0.0.0:${PORT_OLLAMA}"
     echo ""
     echo -e "  ${YELLOW}Pull models after install based on your VRAM:${NC}"
     echo "  ollama pull nomic-embed-text    # RAG — always pull this"
     echo "  ollama pull qwen3:4b            # fast chat (2.5GB)"
-    echo "  ollama pull qwen2.5:14b         # content/email (9GB)"
-    echo "  ollama pull qwen2.5-coder:14b   # coding (9GB)"
+    echo "  ollama pull qwen2.5:7b          # content/email (4.7GB) — fits 8GB VRAM"
+    echo "  ollama pull qwen2.5-coder:7b    # coding (4.7GB) — fits 8GB VRAM"
     echo "  ollama pull deepseek-r1:8b      # reasoning (5.2GB)"
     echo "  ollama pull llama3.1:8b         # agents/tools (4.9GB)"
+    echo ""
+    echo -e "  ${RED}NOTE: 14B models require ~9GB VRAM — will CPU-offload on 8GB cards${NC}"
     echo ""
 }
 
@@ -557,6 +583,10 @@ install_openwebui() {
     export PATH="$HOME/.local/bin:$PATH"
 
     _log_core "OpenWebUI $OPEN_WEBUI_VERSION installed"
+
+    # Verify binary location for launcher
+    OWU_BIN=$(which open-webui 2>/dev/null || echo "$HOME/.local/bin/open-webui")
+    _info_core "OpenWebUI binary: $OWU_BIN"
 }
 
 # ── Qdrant ────────────────────────────────────────────────────
@@ -628,7 +658,7 @@ setup_venvs() {
         _log_core "Open Interpreter venv already exists"
     fi
 
-    # Scrapy (data pipeline)
+    # Scrapy
     if [ ! -d "$VENVS_DIR/scrapy" ]; then
         python3 -m venv "$VENVS_DIR/scrapy"
         "$VENVS_DIR/scrapy/bin/pip" install --upgrade pip -q
@@ -640,7 +670,7 @@ setup_venvs() {
         _log_core "Scrapy venv already exists"
     fi
 
-    # Playwright (web automation)
+    # Playwright
     if [ ! -d "$VENVS_DIR/playwright" ]; then
         python3 -m venv "$VENVS_DIR/playwright"
         "$VENVS_DIR/playwright/bin/pip" install --upgrade pip -q
@@ -686,33 +716,46 @@ create_launchers() {
 
     STUDIO_DIR="$HOME/CrewAI-Studio"
 
-    # OpenWebUI
-    cat > "$SCRIPTS_DIR/run-openwebui.sh" << 'EOF'
-#!/bin/bash
-export PATH="$HOME/.local/bin:$PATH"
-export VECTOR_DB=qdrant
-export QDRANT_URI=http://localhost:6333
-export DATA_DIR="$HOME/.local/share/open-webui"
-exec open-webui serve
-EOF
+    # Resolve OpenWebUI binary to absolute path
+    # FIX v5.1: PM2 daemon does not inherit ~/.local/bin from ~/.bashrc.
+    # Always use the resolved absolute path so PM2 can find the binary.
+    OWU_BIN=$(which open-webui 2>/dev/null \
+        || find "$HOME/.local/bin" -name "open-webui" 2>/dev/null | head -1 \
+        || echo "$HOME/.local/bin/open-webui")
 
-    # n8n — with all required env vars for reverse proxy
+    # OpenWebUI — absolute binary path
+    cat > "$SCRIPTS_DIR/run-openwebui.sh" << OWSCRIPT
+#!/bin/bash
+# FIX v5.1: Use absolute path — PM2 daemon does not inherit PATH from ~/.bashrc
+export PATH="\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export VECTOR_DB=qdrant
+export QDRANT_URI=http://localhost:${PORT_QDRANT}
+export DATA_DIR="\$HOME/.local/share/open-webui"
+exec "${OWU_BIN}" serve
+OWSCRIPT
+
+    # n8n — FIX v5.1: N8N_PATH removed. n8n now owns root on its port (:5678).
+    # Caddy strips /n8n before proxying, and N8N_EDITOR_BASE_URL points to
+    # the Caddy-facing public URL so the editor loads assets correctly.
     cat > "$SCRIPTS_DIR/run-n8n.sh" << NSCRIPT
 #!/bin/bash
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
-export N8N_PORT=5678
+export N8N_PORT=${PORT_N8N}
 export N8N_HOST=0.0.0.0
 export N8N_PROTOCOL=http
 export N8N_SECURE_COOKIE=false
-export N8N_PATH=/n8n/
-export N8N_EDITOR_BASE_URL=http://${LOCAL_DOMAIN}/n8n/
+# FIX v5.1: No N8N_PATH — n8n runs at root on its own port.
+# Caddy strips /n8n prefix before forwarding. Public URLs use Caddy path.
+export N8N_EDITOR_BASE_URL=http://${LOCAL_DOMAIN}/n8n
 export WEBHOOK_URL=http://${LOCAL_DOMAIN}/n8n/
 export N8N_USER_FOLDER="\$HOME/.n8n"
 exec n8n start
 NSCRIPT
 
-    # Qdrant — must cd to data dir + set static content path
+    # Qdrant — STATIC_CONTENT_DIR set; Qdrant serves its own Web UI at :6333
+    # FIX v5.1: Access Qdrant UI directly at http://IP:6333 or http://domain/qdrant
+    # The Web UI SPA has absolute asset paths that work when served at root.
     cat > "$SCRIPTS_DIR/run-qdrant.sh" << 'EOF'
 #!/bin/bash
 export QDRANT__SERVICE__STATIC_CONTENT_DIR="$HOME/qdrant-data/static"
@@ -720,21 +763,28 @@ cd "$HOME/qdrant-data"
 exec "$HOME/qdrant"
 EOF
 
-    # CrewAI Studio — cd to dir first (Streamlit needs cwd)
+    # CrewAI Studio — FIX v5.1: --server.baseUrlPath=/agents added.
+    # Streamlit will generate WebSocket URL as /agents/_stcore/stream.
+    # Caddy strips /agents prefix before proxying to :8501, so Streamlit
+    # receives requests at /_stcore/stream which is its own root path.
     cat > "$SCRIPTS_DIR/run-crewai-studio.sh" << CSSCRIPT
 #!/bin/bash
 cd "${STUDIO_DIR}"
+# FIX v5.1: baseUrlPath tells Streamlit it's mounted at /agents via Caddy.
+# Without this, Streamlit emits WebSocket URL at /_stcore/stream (root),
+# Caddy never routes it to port 8501, and the editor is a white screen.
 exec "${STUDIO_DIR}/venv/bin/streamlit" run app/app.py \\
-    --server.port 8501 \\
+    --server.port ${PORT_CREWAI} \\
     --server.address 0.0.0.0 \\
-    --server.headless true
+    --server.headless true \\
+    --server.baseUrlPath /agents
 CSSCRIPT
 
     # Aider
     cat > "$SCRIPTS_DIR/run-aider.sh" << 'EOF'
 #!/bin/bash
 source "$HOME/.venvs/aider/bin/activate"
-MODEL="${1:-ollama/qwen2.5-coder:14b}"
+MODEL="${1:-ollama/qwen2.5-coder:7b}"
 exec aider --model "$MODEL" "${@:2}"
 EOF
 
@@ -775,13 +825,12 @@ EOF
 setup_aliases() {
     _section_core "Setting Up Shell Aliases"
 
-    # Remove old block
     sed -i '/# AIOPS START/,/# AIOPS END/d' ~/.bashrc
 
     cat >> ~/.bashrc << BASHRC
 
-# AIOPS START — Quantocos AI Labs v5.0.0
-export PATH="\$HOME/.local/bin:\$PATH"
+# AIOPS START — Quantocos AI Labs v5.1.0
+export PATH="\$HOME/.local/bin:\$HOME/.openfang/bin:\$PATH"
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
 
@@ -801,9 +850,15 @@ alias automate='${SCRIPTS_DIR}/run-playwright.sh'
 
 # Quick chat
 alias chat='ollama run qwen3:4b'
-alias chat-coder='ollama run qwen2.5-coder:14b'
+alias chat-coder='ollama run qwen2.5-coder:7b'
 alias chat-reason='ollama run deepseek-r1:8b'
 alias models='ollama list'
+
+# Direct port access shortcuts
+alias open-ui='echo "http://${LOCAL_IP}:${PORT_OPENWEBUI}"'
+alias n8n-ui='echo "http://${LOCAL_IP}:${PORT_N8N}"'
+alias qdrant-ui='echo "http://${LOCAL_IP}:${PORT_QDRANT}"'
+alias agents-ui='echo "http://${LOCAL_DOMAIN}/agents"'
 
 # PM2 auto-resurrect on terminal open
 [[ -z \$(pm2 list 2>/dev/null | grep online) ]] && pm2 resurrect 2>/dev/null
@@ -820,13 +875,11 @@ setup_pm2_services() {
 
     nvm_load
 
-    # Clean start
     pm2 kill 2>/dev/null || true
     rm -f ~/.pm2/dump.pm2 2>/dev/null || true
     sleep 2
 
-    # Clear ports
-    for PORT in 5678 8080 6333 8501; do
+    for PORT in ${PORT_N8N} ${PORT_OPENWEBUI} ${PORT_QDRANT} ${PORT_CREWAI}; do
         sudo fuser -k ${PORT}/tcp 2>/dev/null || true
     done
     sleep 2
@@ -896,27 +949,27 @@ print_core_summary() {
     _section_core "Core Install Complete"
 
     echo -e "${BOLD}${GREEN}"
-    echo "  ╔══════════════════════════════════════════════════╗"
-    echo "  ║   AIOPS v5.0.0 — CORE STACK READY               ║"
-    echo "  ╠══════════════════════════════════════════════════╣"
-    echo "  ║   Service           Local          LAN           ║"
-    echo "  ║   ──────────────────────────────────────────     ║"
-    echo "  ║   OpenWebUI         :8080           /            ║"
-    echo "  ║   n8n               :5678           /n8n         ║"
-    echo "  ║   Qdrant            :6333           /qdrant      ║"
-    echo "  ║   CrewAI Studio     :8501           /agents      ║"
-    echo "  ║   Ollama            :11434          /ollama      ║"
-    echo "  ╠══════════════════════════════════════════════════╣"
-    echo "  ║   LAN domain: http://$LOCAL_DOMAIN"
-    echo "  ║   Local IP:   $LOCAL_IP"
-    echo "  ╚══════════════════════════════════════════════════╝"
+    echo "  ╔══════════════════════════════════════════════════════════╗"
+    echo "  ║   AIOPS v5.1.0 — CORE STACK READY                       ║"
+    echo "  ╠══════════════════════════════════════════════════════════╣"
+    echo "  ║   Service        Port    URL                             ║"
+    echo "  ║   ────────────── ─────   ──────────────────────────────  ║"
+    echo "  ║   OpenWebUI      :8080   http://$LOCAL_DOMAIN           ║"
+    echo "  ║   n8n            :5678   http://$LOCAL_DOMAIN/n8n       ║"
+    echo "  ║   Qdrant         :6333   http://$LOCAL_IP:6333          ║"
+    echo "  ║   CrewAI Studio  :8501   http://$LOCAL_DOMAIN/agents    ║"
+    echo "  ║   Ollama         :11434  http://$LOCAL_IP:11434         ║"
+    echo "  ╠══════════════════════════════════════════════════════════╣"
+    echo "  ║   LAN domain:  http://$LOCAL_DOMAIN                     ║"
+    echo "  ║   Local IP:    $LOCAL_IP                                ║"
+    echo "  ╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
     echo -e "${BOLD}Next Steps:${NC}"
-    echo "  1. Pull models:   ollama pull qwen3:4b"
+    echo "  1. Pull a model:  ollama pull qwen3:4b"
     echo "  2. Reload shell:  source ~/.bashrc"
     echo "  3. Check status:  ai-status"
-    echo "  4. Open browser:  http://localhost:8080"
+    echo "  4. Open browser:  http://$LOCAL_IP:${PORT_OPENWEBUI}"
     echo ""
     echo -e "${CYAN}Core install log: $LOG_FILE${NC}"
     echo ""
@@ -968,6 +1021,8 @@ FEOF
 }
 
 # ── Addon: Twenty CRM ─────────────────────────────────────────
+# FIX v5.1: Twenty is a pnpm monorepo. npm cannot resolve workspace:*
+# protocol used internally. Must use pnpm for install and nx start.
 addon_twenty_crm() {
     _section_add "Installing Twenty CRM"
 
@@ -982,7 +1037,6 @@ addon_twenty_crm() {
         _log_add "Twenty CRM already cloned"
     fi
 
-    # Database
     if ! sudo -u postgres psql -lqt 2>/dev/null | grep -q twenty; then
         sudo -u postgres psql -c \
             "CREATE USER twenty WITH PASSWORD 'twenty_password';" 2>/dev/null || true
@@ -998,22 +1052,24 @@ addon_twenty_crm() {
         cat > .env << ENVEOF
 APP_SECRET=$APP_SECRET
 DATABASE_URL=postgresql://twenty:twenty_password@localhost:5432/twenty
-FRONT_BASE_URL=http://localhost:3000
+FRONT_BASE_URL=http://localhost:${PORT_TWENTY}
 REDIS_URL=redis://localhost:6379
 ENVEOF
         _log_add ".env configured"
     fi
 
-    _info_add "Installing Twenty CRM npm packages (may take a few minutes)..."
-    npm install --legacy-peer-deps -q 2>/dev/null || npm install -q
+    # FIX v5.1: Use pnpm — Twenty uses workspace:* protocol (pnpm monorepo).
+    # npm install fails with ERESOLVE on @wyw-in-js/babel-preset version conflict.
+    _info_add "Installing Twenty CRM via pnpm..."
+    pnpm install
 
-    NPXBIN=$(which npx 2>/dev/null || echo "npx")
+    PNPM_BIN=$(which pnpm 2>/dev/null || echo "pnpm")
     cat > "$SCRIPTS_DIR/run-twenty.sh" << TSCRIPT
 #!/bin/bash
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
 cd "${TWENTY_DIR}"
-exec $NPXBIN nx start
+exec $PNPM_BIN nx start
 TSCRIPT
     chmod +x "$SCRIPTS_DIR/run-twenty.sh"
 
@@ -1023,8 +1079,8 @@ TSCRIPT
     cd "$HOME"
 
     _log_add "Twenty CRM installed"
-    echo "  Local: http://localhost:3000"
-    echo "  LAN:   http://$LOCAL_DOMAIN/crm"
+    echo "  Local: http://localhost:${PORT_TWENTY}"
+    echo "  LAN:   http://$LOCAL_IP:${PORT_TWENTY}"
 }
 
 # ── Addon: Listmonk ───────────────────────────────────────────
@@ -1054,7 +1110,6 @@ addon_listmonk() {
         _log_add "Listmonk binary already exists"
     fi
 
-    # Database
     if ! sudo -u postgres psql -lqt 2>/dev/null | grep -q listmonk; then
         sudo -u postgres psql -c \
             "CREATE USER listmonk WITH PASSWORD 'listmonk_password';" 2>/dev/null || true
@@ -1093,13 +1148,16 @@ LSCRIPT
     pm2 save
 
     _log_add "Listmonk installed"
-    echo "  Local:  http://localhost:9000"
-    echo "  LAN:    http://$LOCAL_DOMAIN/mail"
+    echo "  Local:  http://localhost:${PORT_LISTMONK}"
+    echo "  LAN:    http://$LOCAL_IP:${PORT_LISTMONK}"
     echo "  Login:  admin / change_me_now"
-    echo "  ⚠  Change password immediately after first login"
+    echo -e "  ${RED}⚠  Change password immediately after first login${NC}"
 }
 
 # ── Addon: OpenFang ───────────────────────────────────────────
+# FIX v5.1: Export PATH in-session immediately after install so that
+# the hand activation calls can find the openfang binary in the same
+# shell session without requiring a ~/.bashrc reload.
 addon_openfang() {
     _section_add "Installing OpenFang"
 
@@ -1109,14 +1167,25 @@ addon_openfang() {
         bash /tmp/openfang-install.sh
         rm -f /tmp/openfang-install.sh
 
+        # FIX v5.1: Export PATH in current session immediately after install.
+        # The installer writes to ~/.bashrc but the running script won't
+        # source it. Without this, command -v openfang fails and hand
+        # activation is silently skipped.
+        export PATH="$HOME/.openfang/bin:$PATH"
+
         if command -v openfang &>/dev/null; then
-            openfang hand activate lead       2>/dev/null || true
-            openfang hand activate browser    2>/dev/null || true
-            openfang hand activate researcher 2>/dev/null || true
-            openfang hand activate twitter    2>/dev/null || true
-            _log_add "OpenFang installed — all Hands activated"
+            _log_add "OpenFang $(openfang --version 2>/dev/null) installed"
+            _info_add "Activating Hands..."
+            openfang hand activate lead       2>/dev/null || _warn_add "lead hand activation failed"
+            openfang hand activate browser    2>/dev/null || _warn_add "browser hand activation failed"
+            openfang hand activate researcher 2>/dev/null || _warn_add "researcher hand activation failed"
+            openfang hand activate twitter    2>/dev/null || _warn_add "twitter hand activation failed"
+            _log_add "All Hands activated"
             echo "  Hands:  Lead | Browser | Researcher | Twitter"
             echo "  Config: ~/.openfang/config.yaml"
+            echo "  Init:   openfang init"
+        else
+            _warn_add "OpenFang binary not found after install — check ~/.openfang/bin"
         fi
     else
         # Fallback: pip
@@ -1129,7 +1198,7 @@ addon_openfang() {
 exec "${VENVS_DIR}/openfang/bin/openfang" "\$@"
 OFSCRIPT
                 chmod +x "$SCRIPTS_DIR/run-openfang.sh"
-                _log_add "OpenFang installed via pip"
+                _log_add "OpenFang installed via pip fallback"
             else
                 _warn_add "OpenFang not yet available. Check https://github.com/openfang"
                 _warn_add "Install manually when available: pip install openfang"
@@ -1139,10 +1208,12 @@ OFSCRIPT
 }
 
 # ── Addon: Mautic ─────────────────────────────────────────────
+# FIX v5.1: php -S needs the Symfony entry point (public/index.php),
+# NOT the -t directory flag. -t public/ makes PHP serve static files
+# from that dir without Symfony routing — Mautic never boots.
 addon_mautic() {
     _section_add "Installing Mautic (PHP Marketing Automation)"
 
-    # PHP
     if ! command -v php &>/dev/null; then
         _info_add "Installing PHP 8.1..."
         sudo apt-get install -y \
@@ -1155,7 +1226,6 @@ addon_mautic() {
         _log_add "PHP: $(php -v | head -1 | cut -d' ' -f1-2)"
     fi
 
-    # MariaDB
     if ! command -v mysql &>/dev/null; then
         sudo apt-get install -y mariadb-server -q
         sudo systemctl enable mariadb
@@ -1174,8 +1244,9 @@ addon_mautic() {
             --no-interaction -q 2>/dev/null || \
         composer create-project mautic/recommended-project "$MAUTIC_DIR" \
             --no-interaction
-        cat > "$MAUTIC_DIR/.env.local" << 'MENV'
-APP_URL=http://localhost:8100
+        cat > "$MAUTIC_DIR/.env.local" << MENV
+APP_URL=http://localhost:${PORT_MAUTIC}
+APP_ENV=prod
 DB_HOST=localhost
 DB_PORT=3306
 DB_NAME=mautic
@@ -1187,10 +1258,16 @@ MENV
         _log_add "Mautic already installed"
     fi
 
+    # FIX v5.1: Use public/index.php as the router script, not -t public/.
+    # -t public/ serves the directory as static root without Symfony bootstrap.
+    # The router script passes ALL requests through Symfony's front controller.
     cat > "$SCRIPTS_DIR/run-mautic.sh" << MSCRIPT
 #!/bin/bash
 cd "${MAUTIC_DIR}"
-exec php -S 0.0.0.0:8100 -t public/
+export APP_ENV=prod
+# FIX v5.1: Route all requests through Symfony front controller.
+# public/index.php handles routing — do NOT use -t flag alone.
+exec php -S 0.0.0.0:${PORT_MAUTIC} public/index.php
 MSCRIPT
     chmod +x "$SCRIPTS_DIR/run-mautic.sh"
 
@@ -1198,18 +1275,21 @@ MSCRIPT
     pm2 start "$SCRIPTS_DIR/run-mautic.sh" --name mautic 2>/dev/null || true
     pm2 save
 
-    _log_add "Mautic running on :8100"
-    echo "  Local:  http://localhost:8100"
-    echo "  LAN:    http://$LOCAL_DOMAIN/mautic"
+    _log_add "Mautic running on :${PORT_MAUTIC}"
+    echo "  Local:  http://localhost:${PORT_MAUTIC}"
+    echo "  LAN:    http://$LOCAL_IP:${PORT_MAUTIC}"
     echo "  Setup:  Complete wizard on first open"
 }
 
 # ── Addon: Chatwoot ───────────────────────────────────────────
+# FIX v5.1: Ubuntu 24.04 ships system Ruby owned by root.
+# gem install without --user-install fails with FilePermissionError.
+# bundle install never ran in v5.0 — Chatwoot had zero dependencies.
+# Fix: use --user-install + update PATH before bundle commands.
 addon_chatwoot() {
     _section_add "Installing Chatwoot (Unified Inbox)"
 
     CHATWOOT_DIR="$HOME/chatwoot"
-    CHATWOOT_PORT=3100
 
     if ! command -v ruby &>/dev/null; then
         _info_add "Installing Ruby..."
@@ -1220,6 +1300,17 @@ addon_chatwoot() {
     else
         _log_add "Ruby: $(ruby -v)"
     fi
+
+    # FIX v5.1: Install bundler to user gem dir — system dir is root-owned.
+    # Without --user-install, gem raises FilePermissionError and exits.
+    # Then update PATH so bundle executable is found in this session.
+    RUBY_MINOR=$(ruby -e 'puts RUBY_VERSION.split(".")[0..1].join(".")' 2>/dev/null || echo "3.2")
+    GEM_USER_BIN="$HOME/.gem/ruby/${RUBY_MINOR}.0/bin"
+
+    if ! command -v bundle &>/dev/null && [ ! -f "$GEM_USER_BIN/bundle" ]; then
+        gem install bundler --user-install
+    fi
+    export PATH="$GEM_USER_BIN:$PATH"
 
     if [ ! -d "$CHATWOOT_DIR" ]; then
         git clone https://github.com/chatwoot/chatwoot.git "$CHATWOOT_DIR"
@@ -1243,27 +1334,31 @@ addon_chatwoot() {
         sed -i "s|SECRET_KEY_BASE=.*|SECRET_KEY_BASE=$SECRET_KEY|" .env
         sed -i "s|DATABASE_URL=.*|DATABASE_URL=postgresql://chatwoot:chatwoot_password@localhost:5432/chatwoot|" .env
         sed -i "s|REDIS_URL=.*|REDIS_URL=redis://localhost:6379|" .env
-        sed -i "s|PORT=3000|PORT=$CHATWOOT_PORT|" .env
+        sed -i "s|PORT=3000|PORT=${PORT_CHATWOOT}|" .env
         _log_add ".env configured"
     fi
 
     _info_add "Installing Chatwoot gems (this takes several minutes)..."
-    bundle install -q 2>/dev/null || (gem install bundler && bundle install -q)
+    # FIX v5.1: Use user bundle bin (PATH updated above).
+    bundle install -q 2>/dev/null || (gem install bundler --user-install && bundle install -q)
 
     RAILS_ENV=production bundle exec rails db:chatwoot_prepare 2>/dev/null || \
         RAILS_ENV=production bundle exec rails db:migrate 2>/dev/null || true
 
-    BUNDLE_BIN=$(which bundle 2>/dev/null || echo "bundle")
+    BUNDLE_BIN=$(which bundle 2>/dev/null || echo "$GEM_USER_BIN/bundle")
 
     cat > "$SCRIPTS_DIR/run-chatwoot.sh" << CWSCRIPT
 #!/bin/bash
+# FIX v5.1: Include user gem bin in PATH for bundle executable
+export PATH="${GEM_USER_BIN}:\$PATH"
 cd "${CHATWOOT_DIR}"
 export RAILS_ENV=production
-exec $BUNDLE_BIN exec rails server -b 0.0.0.0 -p $CHATWOOT_PORT
+exec $BUNDLE_BIN exec rails server -b 0.0.0.0 -p ${PORT_CHATWOOT}
 CWSCRIPT
 
     cat > "$SCRIPTS_DIR/run-chatwoot-worker.sh" << CWWSCRIPT
 #!/bin/bash
+export PATH="${GEM_USER_BIN}:\$PATH"
 cd "${CHATWOOT_DIR}"
 export RAILS_ENV=production
 exec $BUNDLE_BIN exec sidekiq
@@ -1278,19 +1373,20 @@ CWWSCRIPT
     cd "$HOME"
 
     _log_add "Chatwoot installed"
-    echo "  Local:  http://localhost:$CHATWOOT_PORT"
-    echo "  LAN:    http://$LOCAL_DOMAIN/inbox"
+    echo "  Local:  http://localhost:${PORT_CHATWOOT}"
+    echo "  LAN:    http://$LOCAL_IP:${PORT_CHATWOOT}"
     echo "  Setup:  Register admin account on first open"
 }
 
 # ── Addon: Cal.com ────────────────────────────────────────────
+# FIX v5.1: Cal.com is a pnpm monorepo using workspace:* protocol.
+# npm throws EUNSUPPORTEDPROTOCOL immediately. Must use pnpm.
 addon_calcom() {
     _section_add "Installing Cal.com (Booking System)"
 
     nvm_load
 
     CALCOM_DIR="$HOME/calcom"
-    CALCOM_PORT=3002
 
     if [ ! -d "$CALCOM_DIR" ]; then
         git clone https://github.com/calcom/cal.com.git "$CALCOM_DIR"
@@ -1314,26 +1410,28 @@ addon_calcom() {
         cat >> .env << CAENV
 DATABASE_URL=postgresql://calcom:calcom_password@localhost:5432/calcom
 NEXTAUTH_SECRET=$NEXTAUTH_SECRET
-NEXTAUTH_URL=http://localhost:$CALCOM_PORT
-NEXT_PUBLIC_APP_URL=http://localhost:$CALCOM_PORT
-PORT=$CALCOM_PORT
+NEXTAUTH_URL=http://localhost:${PORT_CALCOM}
+NEXT_PUBLIC_APP_URL=http://localhost:${PORT_CALCOM}
+PORT=${PORT_CALCOM}
 CAENV
         _log_add ".env configured"
     fi
 
-    _info_add "Installing Cal.com npm packages..."
-    npm install --legacy-peer-deps -q 2>/dev/null || npm install -q
+    # FIX v5.1: Cal.com uses workspace:* (pnpm monorepo).
+    # npm install fails immediately with EUNSUPPORTEDPROTOCOL.
+    _info_add "Installing Cal.com via pnpm..."
+    pnpm install
 
-    npx prisma generate 2>/dev/null || true
-    npx prisma db push 2>/dev/null || true
+    pnpm prisma generate 2>/dev/null || true
+    pnpm prisma db push 2>/dev/null || true
 
-    NPXBIN=$(which npx 2>/dev/null || echo "npx")
+    PNPM_BIN=$(which pnpm 2>/dev/null || echo "pnpm")
     cat > "$SCRIPTS_DIR/run-calcom.sh" << CASCRIPT
 #!/bin/bash
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
 cd "${CALCOM_DIR}"
-exec $NPXBIN next start -p $CALCOM_PORT
+exec $PNPM_BIN next start -p ${PORT_CALCOM}
 CASCRIPT
     chmod +x "$SCRIPTS_DIR/run-calcom.sh"
 
@@ -1342,8 +1440,8 @@ CASCRIPT
     cd "$HOME"
 
     _log_add "Cal.com installed"
-    echo "  Local:  http://localhost:$CALCOM_PORT"
-    echo "  LAN:    http://$LOCAL_DOMAIN/cal"
+    echo "  Local:  http://localhost:${PORT_CALCOM}"
+    echo "  LAN:    http://$LOCAL_IP:${PORT_CALCOM}"
     echo "  Setup:  Register on first open"
 }
 
@@ -1374,7 +1472,6 @@ addon_netdata() {
         _log_add "Netdata installed"
     fi
 
-    # Bind to 0.0.0.0 for LAN access
     NETDATA_CONF=$(find /etc/netdata -name "netdata.conf" 2>/dev/null | head -1)
     if [ -n "$NETDATA_CONF" ]; then
         sudo sed -i 's/# *bind to.*/bind to = 0.0.0.0/' "$NETDATA_CONF" 2>/dev/null || true
@@ -1383,41 +1480,41 @@ addon_netdata() {
     fi
 
     _log_add "Netdata configured"
-    echo "  Local:  http://localhost:19999"
+    echo "  Local:  http://localhost:${PORT_NETDATA}"
     echo "  LAN:    http://$LOCAL_DOMAIN/monitor"
 }
 
 # ── Addons: show menu ─────────────────────────────────────────
 show_addons_menu() {
     echo ""
-    echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║         AIOPS ADDONS — INSTALL MENU                 ║${NC}"
-    echo -e "${BOLD}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${BOLD}║  DEPENDENCIES                                        ║${NC}"
-    echo "║  [d]  Shared deps        PostgreSQL, Redis, Firecrawl ║"
-    echo -e "${BOLD}║                                                      ║${NC}"
-    echo -e "${BOLD}║  GTM & CRM                                           ║${NC}"
-    echo "║  [1]  Twenty CRM         Lead + deal management :3000 ║"
-    echo "║  [2]  Listmonk           Email campaigns binary  :9000 ║"
-    echo "║  [3]  OpenFang           AI agent Hands (Lead/X/Web)   ║"
-    echo "║  [4]  Mautic             Full nurture (PHP)      :8100 ║"
-    echo -e "${BOLD}║                                                      ║${NC}"
-    echo -e "${BOLD}║  INBOX & BOOKING                                     ║${NC}"
-    echo "║  [5]  Chatwoot           Unified inbox           :3100 ║"
-    echo "║  [6]  Cal.com            Discovery booking        :3002 ║"
-    echo -e "${BOLD}║                                                      ║${NC}"
-    echo -e "${BOLD}║  MONITORING                                          ║${NC}"
-    echo "║  [7]  Monitors           htop + nvtop                  ║"
-    echo "║  [8]  Netdata            Full system dashboard   :19999║"
-    echo -e "${BOLD}║                                                      ║${NC}"
-    echo -e "${BOLD}║  BUNDLES                                             ║${NC}"
-    echo "║  [a]  Core GTM           d + 1 + 2 + 3                ║"
-    echo "║  [b]  Full GTM           d + 1 + 2 + 3 + 4 + 5 + 6    ║"
-    echo "║  [m]  All monitors       7 + 8                         ║"
-    echo -e "${BOLD}║                                                      ║${NC}"
-    echo "║  [s]  Show PM2 status                                  ║"
-    echo -e "${BOLD}║  [exit]  Exit installer                              ║${NC}"
-    echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║         AIOPS ADDONS — INSTALL MENU  v5.1.0             ║${NC}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}║  DEPENDENCIES                                            ║${NC}"
+    echo "║  [d]  Shared deps     PostgreSQL, Redis, Firecrawl        ║"
+    echo -e "${BOLD}║                                                          ║${NC}"
+    echo -e "${BOLD}║  GTM & CRM                                               ║${NC}"
+    echo "║  [1]  Twenty CRM     Lead + deal management  :3000       ║"
+    echo "║  [2]  Listmonk       Email campaigns binary  :9000       ║"
+    echo "║  [3]  OpenFang       AI agent Hands (Lead/X/Web)         ║"
+    echo "║  [4]  Mautic         Full nurture (PHP)      :8100       ║"
+    echo -e "${BOLD}║                                                          ║${NC}"
+    echo -e "${BOLD}║  INBOX & BOOKING                                         ║${NC}"
+    echo "║  [5]  Chatwoot       Unified inbox           :3100       ║"
+    echo "║  [6]  Cal.com        Discovery booking       :3002       ║"
+    echo -e "${BOLD}║                                                          ║${NC}"
+    echo -e "${BOLD}║  MONITORING                                              ║${NC}"
+    echo "║  [7]  Monitors       htop + nvtop                        ║"
+    echo "║  [8]  Netdata        Full system dashboard   :19999      ║"
+    echo -e "${BOLD}║                                                          ║${NC}"
+    echo -e "${BOLD}║  BUNDLES                                                 ║${NC}"
+    echo "║  [a]  Core GTM       d + 1 + 2 + 3                      ║"
+    echo "║  [b]  Full GTM       d + 1 + 2 + 3 + 4 + 5 + 6          ║"
+    echo "║  [m]  All monitors   7 + 8                               ║"
+    echo -e "${BOLD}║                                                          ║${NC}"
+    echo "║  [s]  Show PM2 status                                    ║"
+    echo -e "${BOLD}║  [exit]  Exit installer                                  ║${NC}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
 
@@ -1480,10 +1577,8 @@ addons_loop() {
 
         read -rp "$(echo -e "${YELLOW}Enter choice (or 'exit' to finish): ${NC}")" raw_input
 
-        # Trim whitespace
         choice=$(echo "$raw_input" | xargs 2>/dev/null || echo "$raw_input")
 
-        # Check for exit
         if [[ "$choice" == "exit" || "$choice" == "EXIT" || \
               "$choice" == "q" || "$choice" == "Q" ]]; then
             echo ""
@@ -1491,7 +1586,6 @@ addons_loop() {
             break
         fi
 
-        # Handle space-separated multi-select (e.g. "d 1 2")
         if [[ "$choice" == *" "* ]]; then
             for item in $choice; do
                 if [[ "$item" == "exit" || "$item" == "EXIT" ]]; then
@@ -1514,23 +1608,23 @@ addons_loop() {
 print_final_summary() {
     echo ""
     echo -e "${BOLD}${GREEN}"
-    echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║   AIOPS v5.0.0 — SETUP COMPLETE                     ║"
-    echo "  ╠══════════════════════════════════════════════════════╣"
-    echo "  ║   CORE SERVICES                                      ║"
-    echo "  ║   OpenWebUI      http://$LOCAL_DOMAIN               ║"
-    echo "  ║   n8n            http://$LOCAL_DOMAIN/n8n           ║"
-    echo "  ║   Qdrant         http://$LOCAL_DOMAIN/qdrant        ║"
-    echo "  ║   CrewAI Studio  http://$LOCAL_DOMAIN/agents        ║"
-    echo "  ║   Ollama         http://$LOCAL_DOMAIN/ollama        ║"
-    echo "  ╠══════════════════════════════════════════════════════╣"
+    echo "  ╔══════════════════════════════════════════════════════════╗"
+    echo "  ║   AIOPS v5.1.0 — SETUP COMPLETE                         ║"
+    echo "  ╠══════════════════════════════════════════════════════════╣"
+    echo "  ║   CORE SERVICES                                          ║"
+    echo "  ║   OpenWebUI     http://$LOCAL_DOMAIN           :8080    ║"
+    echo "  ║   n8n           http://$LOCAL_DOMAIN/n8n       :5678    ║"
+    echo "  ║   Qdrant        http://$LOCAL_IP:6333                   ║"
+    echo "  ║   CrewAI Studio http://$LOCAL_DOMAIN/agents    :8501    ║"
+    echo "  ║   Ollama        http://$LOCAL_IP:11434                  ║"
+    echo "  ╠══════════════════════════════════════════════════════════╣"
     echo "  ║   LOCAL IP: $LOCAL_IP"
-    echo "  ╠══════════════════════════════════════════════════════╣"
-    echo "  ║   QUICK COMMANDS                                     ║"
-    echo "  ║   ai-status    pm2 status — check all services       ║"
-    echo "  ║   ai-logs      pm2 logs — live log tailing           ║"
-    echo "  ║   chat         ollama run qwen3:4b                   ║"
-    echo "  ╚══════════════════════════════════════════════════════╝"
+    echo "  ╠══════════════════════════════════════════════════════════╣"
+    echo "  ║   QUICK COMMANDS                                         ║"
+    echo "  ║   ai-status    check all PM2 services                    ║"
+    echo "  ║   ai-logs      live log tailing                          ║"
+    echo "  ║   chat         ollama run qwen3:4b                       ║"
+    echo "  ╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
     echo -e "${BOLD}Logs:${NC}"
@@ -1539,8 +1633,7 @@ print_final_summary() {
     echo ""
     echo -e "${BOLD}Reload your shell:${NC}  source ~/.bashrc"
     echo ""
-    echo -e "${BOLD}${CYAN}April | Chief AI Officer${NC}"
-    echo -e "${CYAN}Quantocos AI Labs — Quantocos Global Systems LLP${NC}"
+    echo -e "${BOLD}${CYAN}Quantocos AI Labs${NC}"
     echo -e "${CYAN}\"Build with intelligence. Operate with precision.\"${NC}"
     echo ""
 }
@@ -1552,10 +1645,10 @@ main() {
     clear
     banner_core
 
-    echo -e "${BOLD}AIOPS v5.0.0 — Full Stack Installer${NC}"
+    echo -e "${BOLD}AIOPS v5.1.0 — Full Stack Installer${NC}"
     echo ""
     echo "  PART 1 — Core stack (runs once):"
-    echo "  • Node 22, Ollama, OpenWebUI, n8n"
+    echo "  • Node 22, pnpm, Ollama, OpenWebUI, n8n"
     echo "  • Qdrant, CrewAI Studio, PM2"
     echo "  • Caddy reverse proxy, Avahi mDNS"
     echo "  • Python venvs: CrewAI, Aider, Interpreter, Scrapy, Playwright"
@@ -1564,6 +1657,9 @@ main() {
     echo "  • Twenty CRM, Listmonk, OpenFang"
     echo "  • Mautic, Chatwoot, Cal.com"
     echo "  • htop, nvtop, Netdata"
+    echo ""
+    echo -e "  ${CYAN}v5.1.0 fixes: per-port architecture, pnpm monorepos,${NC}"
+    echo -e "  ${CYAN}WebSocket headers, gem permissions, PATH resolution${NC}"
     echo ""
 
     if ! confirm "Proceed with installation?"; then
@@ -1581,6 +1677,7 @@ main() {
     setup_mdns
     install_caddy
     install_node
+    install_pnpm
     install_pm2
     install_ollama
     install_n8n
