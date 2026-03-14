@@ -572,9 +572,10 @@ QDSCRIPT
 }
 
 # ── OpenWebUI ─────────────────────────────────────────────────
-# KEY FIX: Dedicated venv, launched via `python -m open_webui`.
-# No entry-point binary. No PATH issues. No binary discovery.
-# Venv Python path is absolute and fixed — PM2 calls it directly.
+# Dedicated venv. Launched via venv/bin/open-webui entry point.
+# The venv bin path is fixed and absolute — PM2 calls it directly.
+# python -m open_webui does NOT work (no __main__.py in package).
+# No system PATH needed. Works on any username, any Python version.
 install_openwebui() {
     _section "OpenWebUI"
     conf_load
@@ -606,26 +607,32 @@ install_openwebui() {
         return
     fi
 
-    # Launcher — uses venv Python directly, no binary, no PATH dependency
+    # Launcher — uses venv entry-point binary directly
+    # The venv bin/open-webui script is always at this fixed path.
+    # No system PATH needed. No binary discovery. Works on any username.
+    # NOTE: python -m open_webui does NOT work — package has no __main__.py
     cat > "$SCRIPTS_DIR/run-openwebui.sh" << OWSCRIPT
 #!/bin/bash
 source "${AIOPS_CONF}"
 
-# Use venv Python directly — no binary discovery, no PATH dependency
-VENV_PYTHON="${venv}/bin/python"
+VENV_BIN="${venv}/bin/open-webui"
 
-if [ ! -x "\$VENV_PYTHON" ]; then
-    echo "[x] OpenWebUI venv Python not found at \$VENV_PYTHON"
-    echo "    Run: ${venv}/bin/pip install open-webui"
+if [ ! -x "\$VENV_BIN" ]; then
+    echo "[x] OpenWebUI not found at \$VENV_BIN"
+    echo "    Reinstalling..."
+    "${venv}/bin/pip" install open-webui --no-cache-dir -q
+fi
+
+if [ ! -x "\$VENV_BIN" ]; then
+    echo "[x] OpenWebUI install failed — check ${LOG_FILE}"
     exit 1
 fi
 
 export VECTOR_DB=qdrant
 export QDRANT_URI="http://localhost:\${AIOPS_PORT_QDRANT}"
 export DATA_DIR="\$HOME/.local/share/open-webui"
-export PORT="\${AIOPS_PORT_OPENWEBUI}"
 
-exec "\$VENV_PYTHON" -m open_webui serve --port "\${AIOPS_PORT_OPENWEBUI}"
+exec "\$VENV_BIN" serve --port "\${AIOPS_PORT_OPENWEBUI}"
 OWSCRIPT
     chmod +x "$SCRIPTS_DIR/run-openwebui.sh"
 
