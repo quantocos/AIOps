@@ -1,212 +1,132 @@
 # AIOPS — Local AI Operations Server
 
-A three-file installer for a complete, private, locally-run AI stack.  
-No cloud. No Docker. No API costs. Your data never leaves your machine.
+```
+   ____  _   _   _    _   _ _____ ___   ____  ___  ____
+  / __ \| | | | / \  | \ | |_   _/ _ \ / ___|/ _ \/ ___|
+ | |  | | | | |/ _ \ |  \| | | || | | | |   | | | \___ \
+ | |__| | |_| / ___ \| |\  | | || |_| | |___| |_| |___) |
+  \___\_\\___/_/   \_\_| \_| |_| \___/ \____|\___/|____/
 
-Built for **WSL2 Ubuntu 24.04**.
+  Local AI Operations Server  ·  Quantocos AI Labs  ·  v5.1.0
+```
+
+**A single-command installer that turns a WSL2 machine into a fully operational local AI stack** — chat UI, workflow automation, vector database, agent framework, and optional GTM tooling. No Docker. No cloud dependencies. Everything runs on your hardware.
 
 ---
 
-## Files
+## What It Installs
 
-| File | Platform | Run As | Purpose |
+### Core Stack (Part 1 — automatic)
+
+| Service | Version | Port | Purpose |
 |---|---|---|---|
-| `aiops.sh` | WSL2 / Ubuntu | Normal user | Installs the full AI stack |
-| `aiops-windows.bat` | Windows | Administrator | Port forwarding + LAN autostart |
-| `aiops-tools.sh` | WSL2 / Ubuntu | Normal user | Optional tools — CRM, email, agents, inbox, booking |
+| [Ollama](https://ollama.com) | latest | 11434 | Local LLM inference |
+| [OpenWebUI](https://openwebui.com) | 0.8.10 | 8080 | Chat interface → Ollama |
+| [n8n](https://n8n.io) | latest | 5678 | Workflow automation |
+| [Qdrant](https://qdrant.tech) | v1.17.0 | 6333 | Vector database + Web UI |
+| [CrewAI Studio](https://github.com/strnad/CrewAI-Studio) | latest | 8501 | Visual agent builder |
+| [PM2](https://pm2.keymetrics.io) | latest | — | Process manager |
+| [Caddy](https://caddyserver.com) | v2.11+ | 80 | Reverse proxy |
+| [Avahi](https://avahi.org) | — | — | mDNS `.local` LAN hostname |
 
-Run them in that order. Each is idempotent — safe to re-run if interrupted.
+**Python venvs (isolated):** CrewAI 1.10.1 · Aider 0.86.2 · Open Interpreter 0.4.3 · Scrapy · Playwright
+
+---
+
+### Addons (Part 2 — interactive menu)
+
+| Key | Service | Port | Purpose |
+|---|---|---|---|
+| `d` | Shared deps | — | PostgreSQL · Redis · Firecrawl |
+| `1` | [Twenty CRM](https://twenty.com) | 3000 | Lead and deal management |
+| `2` | [Listmonk](https://listmonk.app) | 9000 | Email campaigns (binary, fast) |
+| `3` | [OpenFang](https://openfang.sh) | — | AI agent Hands (Lead · Browser · Researcher · Twitter) |
+| `4` | [Mautic](https://mautic.org) | 8100 | Full marketing automation (PHP) |
+| `5` | [Chatwoot](https://chatwoot.com) | 3100 | Unified inbox |
+| `6` | [Cal.com](https://cal.com) | 3002 | Booking and scheduling |
+| `7` | htop + nvtop | — | CPU and GPU/VRAM monitoring |
+| `8` | [Netdata](https://netdata.cloud) | 19999 | Full system dashboard |
+| `a` | Core GTM bundle | — | `d + 1 + 2 + 3` |
+| `b` | Full GTM bundle | — | `d + 1 + 2 + 3 + 4 + 5 + 6` |
+| `m` | All monitors | — | `7 + 8` |
 
 ---
 
 ## Quick Start
 
-```bash
-# 1. Clone the repo
-git clone https://github.com/quantocos/AIOps.git
-cd aiops
-
-# 2. Run the main installer (WSL2 terminal)
-bash aiops.sh
-
-# 3. Follow the prompts — you will be asked for:
-#    - Your preferred .local domain name (e.g. myrig → myrig.local)
-#    - A Streamlit email (press Enter to skip)
-
-# 4. When complete, restart WSL from PowerShell:
-#    wsl --shutdown
-#    wsl
-
-# 5. On Windows — run as Administrator:
-#    aiops-windows.bat
-#    (enter the same domain name you used in step 3)
-```
-
-Or install directly without cloning:
+### Linux / WSL2 (existing Ubuntu)
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/quantocos/AIOps/main/aiops.sh)
 ```
 
----
+### Windows (fresh machine)
 
-## What Gets Installed
-
-### Core Stack — `aiops.sh`
-
-| Tool | Purpose | Local Port | LAN Route |
-|---|---|---|---|
-| Ollama | Local LLM server | 11434 | `/ollama` |
-| OpenWebUI | Chat UI + RAG | 8080 | `/` (default) |
-| n8n | Workflow automation | 5678 | `/n8n` |
-| Qdrant | Vector database | 6333 | `/qdrant` |
-| CrewAI Studio | Visual agent builder | 8501 | `/agents` |
-| Caddy | Reverse proxy | 80 | — |
-| Avahi mDNS | `yourname.local` on all LAN devices | — | — |
-| PM2 | Process manager + auto-resurrect | — | — |
-
-### Python Venvs (isolated — no dependency conflicts)
-
-| Venv | Tool | Version |
-|---|---|---|
-| `~/.venvs/crewai` | CrewAI + crewai-tools | 1.10.1 |
-| `~/.venvs/aider` | Aider coding agent | 0.86.2 |
-| `~/.venvs/interpreter` | Open Interpreter | 0.4.3 |
-| `~/.venvs/scrapy` | Scrapy + pandas + dedupe + email-validator | latest |
-| `~/.venvs/playwright` | Playwright + Chromium | latest |
+1. Download [`aiops-windows.bat`](./aiops-windows.bat)
+2. Right-click → **Run as administrator**
+3. The script installs WSL2 + Ubuntu 24.04, configures resources, and launches the installer
 
 ---
 
-## System Requirements
+## Requirements
+
+### Linux / WSL2
 
 | | Minimum | Recommended |
 |---|---|---|
-| OS | WSL2 Ubuntu 22.04 | WSL2 Ubuntu 24.04 |
-| RAM | 16 GB | 32 GB |
-| VRAM | 6 GB | 8 GB+ |
-| Disk | 40 GB free | 80 GB+ |
-| Python | 3.10+ | 3.12 |
-| Internet | Required for install | — |
+| **OS** | Ubuntu 22.04 | Ubuntu 24.04 LTS |
+| **RAM** | 8GB | 32GB |
+| **Disk** | 20GB free | 100GB free |
+| **GPU** | None (CPU mode) | NVIDIA 8GB+ VRAM |
+| **VRAM** | — | 8GB (RTX 3060 Ti class) |
+
+### Windows (for `aiops-windows.bat`)
+
+- Windows 10 Build 19041+ or Windows 11
+- Virtualisation enabled in BIOS (Intel VT-x / AMD-V)
+- Administrator rights
+- Internet connection
 
 ---
 
-## Pulling Models
+## Models — Pull After Install
 
-Model selection depends on your available VRAM. Pull after WSL restarts.
+Open a terminal inside Ubuntu and run:
 
 ```bash
-# Always pull this — powers RAG in OpenWebUI (274MB)
+# Always pull — required for RAG/embeddings
 ollama pull nomic-embed-text
 
-# 6GB VRAM
-ollama pull qwen3:4b
-ollama pull qwen2.5-coder:7b
-ollama pull deepseek-r1:7b
+# Fits 8GB VRAM (RTX 3060 Ti / 3070 class)
+ollama pull qwen3:4b             # Fast chat — 2.5GB
+ollama pull qwen2.5:7b           # Content and email — 4.7GB
+ollama pull qwen2.5-coder:7b     # Coding — 4.7GB
+ollama pull deepseek-r1:8b       # Reasoning — 5.2GB
+ollama pull llama3.1:8b          # Agent tool use — 4.9GB
 
-# 8GB VRAM
-ollama pull qwen3:4b
-ollama pull qwen2.5:14b
-ollama pull qwen2.5-coder:14b
-ollama pull deepseek-r1:8b
-ollama pull llama3.1:8b
-
-# 16GB+ VRAM
-ollama pull qwen3:14b
-ollama pull qwen2.5-coder:14b
-ollama pull deepseek-r1:14b
-```
-
-> **Note:** 14B models require 8GB+ VRAM. If a model offloads to RAM it will run slowly. Use `nvtop` or `nvidia-smi` to monitor VRAM usage.
-
----
-
-## LAN Access
-
-After running `aiops-windows.bat`, all services are accessible from any device on your network — no hosts file edits required on any device.
-
-| Service | URL |
-|---|---|
-| OpenWebUI | `http://yourname.local` |
-| n8n | `http://yourname.local/n8n` |
-| CrewAI Studio | `http://yourname.local/agents` |
-| Qdrant | `http://yourname.local/qdrant` |
-| Ollama API | `http://yourname.local/ollama` |
-
-`.local` domains resolve automatically on macOS, iOS, Android, and Windows 10+ via mDNS (Bonjour protocol). No router config needed.
-
----
-
-## Windows — What `aiops-windows.bat` Does
-
-Run once as Administrator after `aiops.sh` completes and WSL has restarted.
-
-1. Asks for your domain name (must match what you entered in `aiops.sh`)
-2. Creates `C:\autostart\wsl-portproxy.ps1` — detects WSL IP and forwards all ports
-3. Registers a Task Scheduler boot task (`AIOPS-PortProxy`) — runs automatically on every Windows reboot as SYSTEM, no UAC prompt
-4. Adds Windows Firewall rules for all AIOPS ports
-5. Runs the port proxy immediately — LAN access works right now
-
-If your WSL IP changes after a reboot and services stop responding, just re-run `aiops-windows.bat`. The boot task handles this automatically from then on.
-
----
-
-## Optional Tools — `aiops-tools.sh`
-
-Run after `aiops.sh` is complete and WSL has been restarted.
-
-```bash
-bash aiops-tools.sh
-```
-
-Interactive menu — install one tool or a full bundle:
-
-```
-[d] Shared dependencies     PostgreSQL, Redis, Firecrawl venv
-[1] Twenty CRM              Lead and deal management          :3000  /crm
-[2] Listmonk                Email campaigns, single binary    :9000  /mail
-[3] OpenFang                AI agent hands (Lead/Browser/X)
-[4] Mautic                  Nurture sequences + lead scoring  :8100  /mautic
-[5] Chatwoot                Unified inbox                     :3100  /inbox
-[6] Cal.com                 Discovery call booking            :3002  /cal
-
-[a] Core GTM bundle         d + 1 + 2 + 3
-[b] Full stack              Everything above
-```
-
-Install order matters. Always run `[d]` before any numbered option if this is a fresh install.
-
----
-
-## Shell Aliases
-
-Added to `~/.bashrc` by `aiops.sh`:
-
-```bash
-ai-status       # pm2 status
-ai-start        # pm2 resurrect
-ai-stop         # pm2 stop all
-ai-restart      # pm2 restart all
-ai-logs         # pm2 logs
-
-chat            # ollama run qwen3:4b
-chat-coder      # ollama run qwen2.5-coder:14b
-chat-reason     # ollama run deepseek-r1:8b
-models          # ollama list
-
-aider           # Aider coding agent
-crew            # Run a CrewAI script
-interpreter     # Open Interpreter
-scrape          # Scrapy runner
-browser-auto    # Playwright runner
+# Requires 10GB+ VRAM — will CPU-offload on 8GB cards
+# ollama pull qwen2.5:14b
+# ollama pull qwen2.5-coder:14b
 ```
 
 ---
 
-## Directory Structure After Install
+## Directory Structure
+
+After install:
 
 ```
 ~/
-├── scripts/                    # PM2 launcher scripts (all absolute paths)
+├── aiops-server/
+│   ├── install.log          # Core install log
+│   └── addons.log           # Addon install log
+├── agents/
+│   ├── crews/               # CrewAI crew scripts
+│   ├── tasks/               # Task definitions
+│   ├── tools/               # Custom tools
+│   ├── outputs/             # Crew run outputs
+│   └── configs/             # Agent configs
+├── scripts/
 │   ├── run-openwebui.sh
 │   ├── run-n8n.sh
 │   ├── run-qdrant.sh
@@ -214,178 +134,204 @@ browser-auto    # Playwright runner
 │   ├── run-aider.sh
 │   ├── run-crew.sh
 │   ├── run-interpreter.sh
-│   ├── run-scrapy.sh
-│   └── run-playwright.sh
-│
-├── agents/                     # CrewAI workspace
-│   ├── crews/                  # Crew scripts
-│   ├── tasks/                  # Reusable task definitions
-│   ├── tools/                  # Custom tools
-│   ├── outputs/                # Agent outputs
-│   └── configs/                # Model configs
-│
-├── qdrant-data/                # Qdrant persistent storage
-│   ├── static/                 # Dashboard UI files
-│   ├── storage/                # Vector collections
-│   └── snapshots/
-│
-├── CrewAI-Studio/              # Visual agent builder
-│   └── venv/                   # Isolated Python env
-│
-├── .venvs/                     # All isolated Python envs
+│   └── ...
+├── qdrant-data/
+│   ├── static/              # Qdrant Web UI
+│   └── storage/             # Vector data
+├── .venvs/
 │   ├── crewai/
 │   ├── aider/
 │   ├── interpreter/
 │   ├── scrapy/
 │   └── playwright/
-│
-└── aiops-server/
-    ├── install.log
-    └── tools-install.log
+└── CrewAI-Studio/
 ```
 
 ---
 
-## Pinned Versions
+## Shell Aliases
 
-These versions are tested and confirmed working together with zero dependency conflicts.
+After `source ~/.bashrc`:
 
-| Package | Version | Note |
-|---|---|---|
-| open-webui | 0.8.10 | Pinned — newer versions break qdrant-client |
-| qdrant | v1.17.0 | Binary release |
-| qdrant-web-ui | v0.2.7 | Static dashboard files |
-| crewai | 1.10.1 | Isolated venv |
-| crewai-tools | 1.10.1 | Isolated venv |
-| aider-chat | 0.86.2 | Isolated venv |
-| open-interpreter | 0.4.3 | Isolated venv |
-| Node.js | 22 | Via NVM |
-| PM2 | latest | Via NVM npm |
-
----
-
-## Why Isolated Python Venvs?
-
-OpenWebUI, CrewAI, Aider, and Open Interpreter all conflict on shared packages:
-
-| Package | OpenWebUI needs | Aider needs | Result |
-|---|---|---|---|
-| fastapi | 0.135.1 | 0.128.8 | Conflict |
-| aiohttp | 3.13.2 | 3.13.3 | Conflict |
-| starlette | 0.52.1 | <0.38.0 | Conflict |
-| tiktoken | ~0.8.0 | 0.12.0 | Conflict |
-
-Installing anything globally breaks something else. Every AI tool in its own venv = zero conflicts, clean installs, easy rebuilds.
-
----
-
-## Troubleshooting
-
-**Services not starting after WSL restart**
 ```bash
-source ~/.bashrc
-ai-status
-# If nothing is online:
-ai-start
-```
+# Service management
+ai-status      # pm2 status — all services
+ai-start       # pm2 resurrect — start saved processes
+ai-stop        # pm2 stop all
+ai-restart     # pm2 restart all
+ai-logs        # pm2 logs — live tailing
 
-**OpenWebUI broken after pip update**
-```bash
-pip install "fastapi==0.135.1" "aiohttp==3.13.2" --break-system-packages --force-reinstall
-pm2 restart openwebui
-```
+# AI tools
+aider          # Aider code assistant
+crew           # Run a CrewAI script
+interpreter    # Open Interpreter
+scrape         # Scrapy runner
+automate       # Playwright runner
 
-**n8n editor loads blank / white screen**
-```bash
-# Verify env vars in launcher
-cat ~/scripts/run-n8n.sh
-# N8N_PATH and N8N_EDITOR_BASE_URL must be set
-pm2 restart n8n
-pm2 logs n8n --lines 20 --nostream
-```
-
-**CrewAI Studio crash loop**
-```bash
-pm2 stop crewai-studio
-cd ~/CrewAI-Studio && rm -rf venv
-python3 -m venv venv
-source venv/bin/activate && pip install -r requirements.txt
-pm2 start crewai-studio
-```
-
-**Qdrant dashboard 404**
-```bash
-ls ~/qdrant-data/static/index.html  # must exist
-cat ~/scripts/run-qdrant.sh         # must have STATIC_CONTENT_DIR set
-pm2 restart qdrant
-```
-
-**Port already in use**
-```bash
-sudo fuser -k 8080/tcp   # replace with the conflicting port
-pm2 restart openwebui
-```
-
-**LAN devices can't reach yourname.local**
-```bash
-# On Windows (PowerShell as Admin):
-# Re-run aiops-windows.bat
-# Or manually:
-$wslIP = (wsl hostname -I).Trim().Split()[0]
-netsh interface portproxy reset
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=$wslIP connectport=80
-```
-
-**PM2 duplicate processes**
-```bash
-pm2 kill
-rm ~/.pm2/dump.pm2
-pm2 start ~/scripts/run-n8n.sh --name n8n
-pm2 start ~/scripts/run-openwebui.sh --name openwebui
-pm2 start ~/scripts/run-qdrant.sh --name qdrant
-pm2 start ~/scripts/run-crewai-studio.sh --name crewai-studio
-pm2 save
+# Chat shortcuts
+chat           # ollama run qwen3:4b
+chat-coder     # ollama run qwen2.5-coder:7b
+chat-reason    # ollama run deepseek-r1:8b
+models         # ollama list
 ```
 
 ---
 
 ## Architecture
 
+### Per-Port Design
+
+Every service owns its own port. No subpath proxying for WebSocket-heavy applications.
+
 ```
-Operator (HITL — approves all outputs)
-         |
-         v
-  deepseek-r1 (Supervisor / Planner)
-         |
-    _____|_____
-   |           |
-qwen2.5:14b   llama3.1:8b
-(content/email) (tool calls/agents)
-         |
-   ______|______
-  |      |      |
- n8n  CrewAI  Interpreter
-  |
-Qdrant (RAG / knowledge base)
+Windows / LAN Browser
+        │
+        ▼
+   Caddy :80
+        │
+   ┌────┴──────────────────────┐
+   │                           │
+   /n8n   → strip → :5678     /agents → strip → :8501
+   /qdrant → strip → :6333    /monitor → strip → :19999
+   /ollama → strip → :11434   /* → :8080 (OpenWebUI)
+   │
+   Direct port access (no proxy needed):
+   :6333  Qdrant UI + API    (SPA served at root — no asset path issues)
+   :11434 Ollama API
+   :3000  Twenty CRM
+   :9000  Listmonk
+   :8100  Mautic
+   :3100  Chatwoot
+   :3002  Cal.com
+   :19999 Netdata
+```
+
+### WebSocket Handling
+
+Caddy is configured with `Connection "Upgrade"` (literal string) for all WebSocket-capable routes. This fixes the WSOD (White Screen of Death) issues caused by the `{http.headers.Connection}` placeholder which does not reliably forward upgrade requests.
+
+### Streamlit (CrewAI Studio)
+
+Streamlit runs with `--server.baseUrlPath /agents` so it generates correct WebSocket URLs (`/agents/_stcore/stream`). Caddy strips the `/agents` prefix before proxying, so Streamlit receives requests at its own root.
+
+---
+
+## Troubleshooting
+
+### White screen on n8n / CrewAI Studio
+
+Check PM2 and logs:
+
+```bash
+ai-status
+pm2 logs n8n --lines 50
+pm2 logs crewai-studio --lines 50
+```
+
+Restart Caddy if routing broke:
+
+```bash
+sudo systemctl restart caddy
+sudo caddy validate --config /etc/caddy/Caddyfile
+```
+
+### OpenWebUI not starting
+
+```bash
+pm2 logs openwebui --lines 30
+# If binary not found:
+which open-webui || find ~/.local/bin -name open-webui
+# Edit launcher with correct path:
+nano ~/scripts/run-openwebui.sh
+pm2 restart openwebui
+```
+
+### Ollama not responding
+
+```bash
+sudo systemctl status ollama
+sudo systemctl restart ollama
+# Test:
+curl http://localhost:11434/api/tags
+```
+
+### Port already in use
+
+```bash
+sudo fuser -k 8080/tcp   # Replace with conflicting port
+pm2 restart openwebui
+```
+
+### WSL2 memory issues
+
+Edit `~/.wslconfig` on Windows (or `%USERPROFILE%\.wslconfig`):
+
+```ini
+[wsl2]
+memory=16GB
+processors=8
+swap=8GB
+```
+
+Then restart WSL: `wsl --shutdown` from PowerShell.
+
+### Chatwoot gems missing
+
+```bash
+cd ~/chatwoot
+RUBY_MINOR=$(ruby -e 'puts RUBY_VERSION.split(".")[0..1].join(".")')
+export PATH="$HOME/.gem/ruby/${RUBY_MINOR}.0/bin:$PATH"
+gem install bundler --user-install
+bundle install
+pm2 restart chatwoot chatwoot-worker
+```
+
+### Twenty CRM / Cal.com npm errors
+
+Both use pnpm monorepos. If you see `ERESOLVE` or `workspace:*` errors:
+
+```bash
+npm install -g pnpm
+cd ~/twenty && pnpm install
+# or
+cd ~/calcom && pnpm install
+pm2 restart twenty
+pm2 restart calcom
 ```
 
 ---
 
-## Roadmap
+## Version History
 
-- [ ] macOS Apple Silicon support
-- [ ] Ubuntu Server / VPS variant
-- [ ] Auto VRAM detection for model recommendations
-- [ ] Cloudflare Tunnel integration for public access
-- [ ] HITL dashboard UI (React on n8n webhooks)
-- [ ] Web-based health dashboard
+### v5.1.0 — Current
+- **Fixed:** Per-port architecture — WebSocket-heavy apps no longer routed via subpath
+- **Fixed:** OpenWebUI PM2 launch — absolute binary path resolves `~/.local/bin` not in PM2 daemon PATH
+- **Fixed:** n8n WSOD — `Connection "Upgrade"` literal in Caddy; `uri strip_prefix /n8n` added
+- **Fixed:** Qdrant UI WSOD — SPA served at root on `:6333`; no broken asset path resolution
+- **Fixed:** CrewAI Studio WSOD — `--server.baseUrlPath /agents` + `uri strip_prefix /agents` + correct WS headers
+- **Fixed:** Twenty CRM — `pnpm install` replaces `npm install` (resolves `@wyw-in-js` dependency conflict)
+- **Fixed:** Cal.com — `pnpm install` replaces `npm install` (resolves `workspace:*` protocol error)
+- **Fixed:** Chatwoot — `gem install bundler --user-install` for system Ruby on Ubuntu 24.04
+- **Fixed:** OpenFang — `export PATH` in-session after install so hand activation runs in same shell
+- **Fixed:** Mautic — `php -S 0.0.0.0:8100 public/index.php` (Symfony front controller, not `-t public/`)
+- **Added:** `install_pnpm()` to core stack (required for Twenty and Cal.com addons)
+- **Added:** `aiops-windows.bat` — Windows bootstrap with WSL2 install, `.wslconfig`, port forwarding, scheduled task
+- **Added:** QUANTOCOS ASCII art header
+
+### v5.0.0
+- Initial release with core stack + full GTM addon suite
+- Subpath Caddy routing (introduced WebSocket WSOD bugs — fixed in v5.1.0)
 
 ---
 
 ## License
 
-MIT — use freely, modify freely, share freely.
+MIT — see [LICENSE](./LICENSE)
 
 ---
 
-*Quantocos AI Labs — AIOPS v3.0.0*
+## Author
+
+**Quantocos AI Labs**  
+Part of the [Quantocos](https://quantocos.com) ecosystem.  
+*"Build with intelligence. Operate with precision."*
